@@ -68,7 +68,6 @@ def train(args, model, device, train_loader, optimizer, epoch):
 def test(model, device, test_loader):
     model.eval()
     test_loss = 0
-    correct = 0
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
@@ -104,6 +103,8 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+    parser.add_argument('--load-model', action='store_true', default=False,
+                        help='For Loading the saved Model')
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -130,6 +131,8 @@ def main():
     test_loader = DataLoader(test_set, **test_kwargs)
 
     model = PosNet().to(device)
+    if args.load_model:
+        model.load_state_dict(torch.load('pos_weights.pt'))
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
@@ -139,7 +142,14 @@ def main():
         scheduler.step()
 
     if args.save_model:
-        torch.save(model.state_dict(), "pos.pt")
+        model.cpu()
+        model.eval()
+        example = torch.rand(1, 25)
+        traced_script_module = torch.jit.trace(model, example)
+        traced_script_module.save("pos_model.pt")
+        torch.save(model.state_dict(), "pos_weights.pt")
+        example = torch.ones(1, 25)
+        print(model(example))
 
 
 if __name__ == '__main__':
