@@ -58,7 +58,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+            print("Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
             if args.dry_run:
@@ -76,7 +76,7 @@ def test(model, device, test_loader):
 
     test_loss /= len(test_loader.dataset)
 
-    print('\nTest set: Average loss: {:.4f}\n'.format(
+    print("\nTest set: Average loss: {:.4f}\n".format(
         test_loss))
 
 
@@ -105,6 +105,10 @@ def main():
                         help='For Saving the current Model')
     parser.add_argument('--load-model', action='store_true', default=False,
                         help='For Loading the saved Model')
+    parser.add_argument('--save-checkpoint', action='store_true', default=False,
+                        help='For Saving the checkpoint')
+    parser.add_argument('--load-checkpoint', action='store_true', default=False,
+                        help='For Loading the checkpoint')
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -130,24 +134,38 @@ def main():
     train_loader = DataLoader(train_set, **train_kwargs)
     test_loader = DataLoader(test_set, **test_kwargs)
 
+    epochs_trained = 0
     model = PosNet().to(device)
     if args.load_model:
-        model.load_state_dict(torch.load('pos_weights.pt'))
+        model.load_state_dict(torch.load("save/pos_weights.pt"))
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if args.load_checkpoint:
+        print("\nLoading checkpoint\n")
+        checkpoint = torch.load("save/checkpoint")
+        epochs_trained = checkpoint['epoch']
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(epochs_trained + 1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)
         test(model, device, test_loader)
         scheduler.step()
+        if args.save_checkpoint:
+            print("\nSaving checkpoint\n")
+            torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        }, "save/checkpoint")
 
     if args.save_model:
         model.cpu()
         model.eval()
         example = torch.rand(1, 25)
         traced_script_module = torch.jit.trace(model, example)
-        traced_script_module.save("pos_model.pt")
-        torch.save(model.state_dict(), "pos_weights.pt")
+        traced_script_module.save("save/pos_model.pt")
+        torch.save(model.state_dict(), "save/pos_weights.pt")
         example = torch.ones(1, 25)
         print(model(example))
 
