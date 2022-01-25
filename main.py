@@ -1,6 +1,7 @@
 from __future__ import print_function
 import argparse
 import numpy as np
+import uproot as ur
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,43 +9,46 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Dataset, DataLoader, random_split
 
-class PosData(Dataset):
-    def __init__(self, num):
-        self.idx = np.arange(num)
+
+class NtruthData(Dataset):
+    def __init__(self):
+        tree = ur.concatenate("data/training-*.root:T",
+                ["adc", "layer", "ztan", "ntruth"], library='np')
+        self.n = len(tree["layer"])
         self.input = []
-        self.output = []
-        for i in range(num):
-            rnd = np.random.normal(size=25)
-            self.input.append(np.float32(rnd))
-            rnd = np.random.normal(size=2)
-            self.output.append(np.float32(rnd))
+        self.target = []
+        for i in range(self.n):
+            input = np.concatenate((tree["adc"][i], tree["layer"][i], tree["ztan"][i]), axis=None)
+            target = min(tree["ntruth"][i], 3)
+            self.input.append(np.single(input))
+            self.target.append(np.int_(target))
     
     def __len__(self):
-        return len(self.idx)
+        return self.n
 
     def __getitem__(self, idx):
         input = self.input[idx]
-        output = self.output[idx]
-        return input, output
+        target = self.target[idx]
+        return input, target
 
 
-class PosNet(nn.Module):
+class NtruthNet(nn.Module):
     def __init__(self):
-        super(PosNet, self).__init__()
-        self.fc1 = nn.Linear(25, 10)
+        super(NtruthNet, self).__init__()
+        self.fc1 = nn.Linear(11*11+2, 10)
         self.fc2 = nn.Linear(10, 10)
-        self.fc3 = nn.Linear(10, 2)
+        self.fc3 = nn.Linear(10, 4)
         self.norm1 = nn.BatchNorm1d(10)
 
     def forward(self, x):
         x = self.fc1(x)
         x = self.norm1(x)
-        x = F.relu(x)
+        x = F.sigmoid(x)
         x = self.fc2(x)
         x = self.norm1(x)
-        x = F.relu(x)
+        x = F.sigmoid(x)
         x = self.fc3(x)
-        output = x
+        output = F.log_softmax(x, dim=1)
         return output
 
 
@@ -54,7 +58,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.mse_loss(output, target)
+        loss = F.nll_loss(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -68,29 +72,33 @@ def train(args, model, device, train_loader, optimizer, epoch):
 def test(model, device, test_loader):
     model.eval()
     test_loss = 0
+    correct = 0
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += F.mse_loss(output, target, reduction='sum').item()  # sum up batch loss
+            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
+            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
 
     test_loss /= len(test_loader.dataset)
 
-    print("\nTest set: Average loss: {:.4f}\n".format(
-        test_loss))
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
 
 
 def main():
     # Training settings
-    parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
-    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
-                        help='input batch size for training (default: 64)')
+    parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
+    parser.add_argument('--batch-size', type=int, default=640, metavar='N',
+                        help='input batch size for training (default: 640)')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='input batch size for testing (default: 1000)')
     parser.add_argument('--epochs', type=int, default=14, metavar='N',
                         help='number of epochs to train (default: 14)')
-    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
-                        help='learning rate (default: 0.001)')
+    parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
+                        help='learning rate (default: 1.0)')
     parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
                         help='Learning rate step gamma (default: 0.7)')
     parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -99,7 +107,7 @@ def main():
                         help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=10, metavar='N',
+    parser.add_argument('--log-interval', type=int, default=100, metavar='N',
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
@@ -126,18 +134,18 @@ def main():
         train_kwargs.update(cuda_kwargs)
         test_kwargs.update(cuda_kwargs)
 
-    nevents = 64000
+    dataset = NtruthData()
+    nevents = len(dataset)
     ntrain = int(nevents*0.8)
     ntest = nevents - ntrain
-    dataset = PosData(nevents)
     train_set, test_set = random_split(dataset, [ntrain, ntest])
     train_loader = DataLoader(train_set, **train_kwargs)
     test_loader = DataLoader(test_set, **test_kwargs)
 
     epochs_trained = 0
-    model = PosNet().to(device)
+    model = NtruthNet().to(device)
     if args.load_model:
-        model.load_state_dict(torch.load("save/pos_weights.pt"))
+        model.load_state_dict(torch.load("save/ntruth_weights.pt"))
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     if args.load_checkpoint:
         print("\nLoading checkpoint\n")
@@ -164,8 +172,8 @@ def main():
         model.eval()
         example = torch.rand(1, 25)
         traced_script_module = torch.jit.trace(model, example)
-        traced_script_module.save("save/pos_model.pt")
-        torch.save(model.state_dict(), "save/pos_weights.pt")
+        traced_script_module.save("save/ntruth_model.pt")
+        torch.save(model.state_dict(), "save/ntruth_weights.pt")
         example = torch.ones(1, 25)
         print(model(example))
 
