@@ -1,7 +1,6 @@
 from __future__ import print_function
 import argparse
 import os
-import numpy as np
 import uproot as ur
 import torch
 import torch.nn as nn
@@ -18,10 +17,14 @@ class NtruthData(Dataset):
         self.input = []
         self.target = []
         for i in range(self.n):
-            input = np.concatenate((tree["adc"][i], tree["layer"][i], tree["ztan"][i]), axis=None)
-            target = min(tree["ntruth"][i], 3)
-            self.input.append(np.single(input))
-            self.target.append(np.int_(target))
+            adc = torch.from_numpy(tree["adc"][i]).view(11, 11).type(dtype=torch.float32)
+            layer = torch.full((11, 11), tree["layer"][i], dtype=torch.float32)
+            ztan = torch.full((11, 11), tree["ztan"][i], dtype=torch.float32)
+            ntruth = min(tree["ntruth"][i], 3)
+            input = torch.stack((adc, layer, ztan), dim=0)
+            target = torch.tensor(ntruth, dtype=torch.int64)
+            self.input.append(input)
+            self.target.append(target)
     
     def __len__(self):
         return self.n
@@ -35,19 +38,31 @@ class NtruthData(Dataset):
 class NtruthNet(nn.Module):
     def __init__(self):
         super(NtruthNet, self).__init__()
-        self.fc1 = nn.Linear(11*11+2, 10)
-        self.fc2 = nn.Linear(10, 10)
-        self.fc3 = nn.Linear(10, 4)
-        self.norm1 = nn.BatchNorm1d(10)
+        self.conv1 = nn.Conv2d(3, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(64*16, 128)
+        self.fc2 = nn.Linear(128, 4)
+        self.norm1 = nn.BatchNorm2d(32)
+        self.norm2 = nn.BatchNorm2d(64)
+        self.norm3 = nn.BatchNorm1d(128)
 
     def forward(self, x):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = self.norm2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2, ceil_mode=True)
+        x = self.dropout1(x)
+        x = torch.flatten(x, start_dim=1)
         x = self.fc1(x)
-        x = self.norm1(x)
-        x = torch.sigmoid(x)
+        x = self.norm3(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
         x = self.fc2(x)
-        x = self.norm1(x)
-        x = torch.sigmoid(x)
-        x = self.fc3(x)
         output = F.log_softmax(x, dim=1)
         return output
 
@@ -91,25 +106,25 @@ def test(model, device, test_loader):
 def main():
     # Training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
-    parser.add_argument('--data-size', type=int, default=10, metavar='N',
-                        help='number of files for each training and testing (default: 10)')
-    parser.add_argument('--batch-size', type=int, default=640, metavar='N',
-                        help='input batch size for training (default: 640)')
-    parser.add_argument('--test-batch-size', type=int, default=10000, metavar='N',
-                        help='input batch size for testing (default: 10000)')
+    parser.add_argument('--data-size', type=int, default=1, metavar='N',
+                        help='number of files for each training and testing (default: 1)')
+    parser.add_argument('--batch-size', type=int, default=256, metavar='N',
+                        help='input batch size for training (default: 256)')
+    parser.add_argument('--test-batch-size', type=int, default=1024, metavar='N',
+                        help='input batch size for testing (default: 1024)')
     parser.add_argument('--epochs', type=int, default=10, metavar='N',
                         help='number of epochs to train (default: 10)')
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
-    parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
-                        help='Learning rate step gamma (default: 0.7)')
+    parser.add_argument('--gamma', type=float, default=0.9, metavar='M',
+                        help='Learning rate step gamma (default: 0.9)')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disables CUDA training')
     parser.add_argument('--dry-run', action='store_true', default=False,
                         help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=100, metavar='N',
+    parser.add_argument('--log-interval', type=int, default=400, metavar='N',
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
@@ -179,11 +194,11 @@ def main():
     if args.save_model:
         model.cpu()
         model.eval()
-        example = torch.rand(1, 11*11+2)
+        example = torch.rand(1, 3, 11, 11)
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save("save/ntruth_model.pt")
         torch.save(model.state_dict(), "save/ntruth_weights.pt")
-        example = torch.ones(1, 11*11+2)
+        example = torch.ones(1, 3, 11, 11)
         print(model(example))
 
 
