@@ -90,18 +90,19 @@ def test(model, device, test_loader):
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            # sum up batch loss for each element
-            test_loss += F.mse_loss(output, target, reduction='sum').item() / len(output[0].view(-1))
+            # sum up batch loss for all elements
+            test_loss += F.mse_loss(output, target, reduction='sum').item()
             # get the index of the peak
-            pred = torch.flatten(F.avg_pool2d(output, 3, ceil_mode=True), start_dim=1).argmax(dim=1, keepdim=True)
-            true = torch.flatten(F.avg_pool2d(target, 3, ceil_mode=True), start_dim=1).argmax(dim=1, keepdim=True)
-            correct += pred.eq(true).sum().item()
+            pred = output.argmax(dim=2)
+            refs = target.argmax(dim=2)
+            correct += pred.eq(refs).sum().item()
 
-    test_loss /= len(test_loader.dataset)
+    # mean batch loss for each element
+    test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].view(-1))
 
     print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+        test_loss, correct, len(test_loader.dataset) * len(test_loader.dataset[0][1]),
+        100. * correct / len(test_loader.dataset) / len(test_loader.dataset[0][1])))
 
 
 def main():
