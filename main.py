@@ -10,22 +10,21 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Dataset, DataLoader, random_split
 
 
-class NtruthData(Dataset):
+class Data(Dataset):
     def __init__(self, files):
-        tree = ur.concatenate(files, ["adc", "layer", "ztan", "ntruth"], library='np')
+        tree = ur.concatenate(files, ["adc", "layer", "ztan", "gedep"], library='np')
         self.n = len(tree["layer"])
         self.input = []
         self.target = []
         for i in range(self.n):
-            adc = torch.from_numpy(tree["adc"][i]).view(11, 11).type(dtype=torch.float32)
-            layer = torch.full((11, 11), tree["layer"][i], dtype=torch.float32)
-            ztan = torch.full((11, 11), tree["ztan"][i], dtype=torch.float32)
-            ntruth = min(tree["ntruth"][i], 3)
+            adc = torch.clamp(torch.sub(torch.from_numpy(tree["adc"][i]), 75), min=0).view(21, 21).type(dtype=torch.float32)
+            layer = torch.full((21, 21), tree["layer"][i], dtype=torch.float32)
+            ztan = torch.full((21, 21), tree["ztan"][i], dtype=torch.float32)
             input = torch.stack((adc, layer, ztan), dim=0)
-            target = torch.tensor(ntruth, dtype=torch.int64)
+            target = torch.clamp(torch.mul(torch.from_numpy(tree["gedep"][i]), 1e6), max=10).view(21, 21).type(dtype=torch.float32)
             self.input.append(input)
             self.target.append(target)
-    
+
     def __len__(self):
         return self.n
 
@@ -35,15 +34,15 @@ class NtruthData(Dataset):
         return input, target
 
 
-class NtruthNet(nn.Module):
+class Net(nn.Module):
     def __init__(self):
-        super(NtruthNet, self).__init__()
+        super(Net, self).__init__()
         self.conv1 = nn.Conv2d(3, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(64*16, 128)
-        self.fc2 = nn.Linear(128, 4)
+        self.fc1 = nn.Linear(64*81, 128)
+        self.fc2 = nn.Linear(128, 21*21)
         self.norm1 = nn.BatchNorm2d(32)
         self.norm2 = nn.BatchNorm2d(64)
         self.norm3 = nn.BatchNorm1d(128)
@@ -63,7 +62,7 @@ class NtruthNet(nn.Module):
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
+        output = torch.clamp(x, min=0, max=10).view(-1, 21, 21)
         return output
 
 
@@ -73,15 +72,14 @@ def train(args, model, device, train_loader, optimizer, epoch):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
-        loss = F.nll_loss(output, target)
+        # mean batch loss for each element
+        loss = F.mse_loss(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print("Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
-            if args.dry_run:
-                break
 
 
 def test(model, device, test_loader):
@@ -92,20 +90,25 @@ def test(model, device, test_loader):
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
+            # sum up batch loss for each element
+            test_loss += F.mse_loss(output, target, reduction='sum').item() / len(output[0].view(-1))
+            # get the index of the peak
+            pred = torch.flatten(F.avg_pool2d(output, 3, ceil_mode=True), start_dim=1).argmax(dim=1, keepdim=True)
+            true = torch.flatten(F.avg_pool2d(target, 3, ceil_mode=True), start_dim=1).argmax(dim=1, keepdim=True)
+            correct += pred.eq(true).sum().item()
 
     test_loss /= len(test_loader.dataset)
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+    print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
 
 
 def main():
-    # Training settings
+    # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
+    parser.add_argument('--nfiles', type=int, default=10000, metavar='N',
+                        help='max number of files used for training (default: 10000)')
     parser.add_argument('--data-size', type=int, default=1, metavar='N',
                         help='number of files for each training and testing (default: 1)')
     parser.add_argument('--batch-size', type=int, default=256, metavar='N',
@@ -117,23 +120,21 @@ def main():
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
     parser.add_argument('--gamma', type=float, default=0.9, metavar='M',
-                        help='Learning rate step gamma (default: 0.9)')
+                        help='learning rate step gamma (default: 0.9)')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disables CUDA training')
-    parser.add_argument('--dry-run', action='store_true', default=False,
-                        help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=400, metavar='N',
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
-                        help='For Saving the current Model')
+                        help='save the current model')
     parser.add_argument('--load-model', action='store_true', default=False,
-                        help='For Loading the saved Model')
+                        help='load the saved model')
     parser.add_argument('--save-checkpoint', action='store_true', default=False,
-                        help='For Saving the checkpoint')
+                        help='save checkpoints')
     parser.add_argument('--load-checkpoint', action='store_true', default=False,
-                        help='For Loading the checkpoint')
+                        help='load the saved checkpoint')
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -158,11 +159,11 @@ def main():
             file.is_file()):
             files.append(file.path + ":T")
     nfiles = len(files)
-    
+
     sets_trained = 0
-    model = NtruthNet().to(device)
+    model = Net().to(device)
     if args.load_model:
-        model.load_state_dict(torch.load("save/ntruth_weights.pt"))
+        model.load_state_dict(torch.load("save/net_weights.pt"))
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     if args.load_checkpoint:
         print("\nLoading checkpoint\n")
@@ -173,7 +174,7 @@ def main():
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for iset in range(sets_trained, nfiles, args.data_size):
-        dataset = NtruthData(files[iset:min(iset+args.data_size,nfiles)])
+        dataset = Data(files[iset:min(iset+args.data_size,args.nfiles,nfiles)])
         nevents = len(dataset)
         ntrain = int(nevents*0.9)
         ntest = nevents - ntrain
@@ -186,7 +187,7 @@ def main():
             scheduler.step()
         if args.save_checkpoint:
             print("\nSaving checkpoint\n")
-            torch.save({'sets_trained': iset + args.data_size,
+            torch.save({'sets_trained': min(iset+args.data_size,args.nfiles,nfiles),
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         }, "save/checkpoint")
@@ -194,11 +195,11 @@ def main():
     if args.save_model:
         model.cpu()
         model.eval()
-        example = torch.rand(1, 3, 11, 11)
+        example = torch.rand(1, 3, 21, 21)
         traced_script_module = torch.jit.trace(model, example)
-        traced_script_module.save("save/ntruth_model.pt")
-        torch.save(model.state_dict(), "save/ntruth_weights.pt")
-        example = torch.ones(1, 3, 11, 11)
+        traced_script_module.save("save/net_model.pt")
+        torch.save(model.state_dict(), "save/net_weights.pt")
+        example = torch.ones(1, 3, 21, 21)
         print(model(example))
 
 
