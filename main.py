@@ -13,20 +13,14 @@ from torch.utils.data import Dataset, DataLoader, random_split
 class Data(Dataset):
     def __init__(self, files):
         tree = ur.concatenate(files, ["adc", "layer", "ztan", "gedep"], library='np')
-        self.n = len(tree["layer"])
-        self.input = []
-        self.target = []
-        for i in range(self.n):
-            adc = torch.clamp(torch.sub(torch.from_numpy(tree["adc"][i]), 75), min=0).view(21, 21).type(dtype=torch.float32)
-            layer = torch.full((21, 21), tree["layer"][i], dtype=torch.float32)
-            ztan = torch.full((21, 21), tree["ztan"][i], dtype=torch.float32)
-            input = torch.stack((adc, layer, ztan), dim=0)
-            target = torch.clamp(torch.mul(torch.from_numpy(tree["gedep"][i]), 1e6), max=10).view(21, 21).type(dtype=torch.float32)
-            self.input.append(input)
-            self.target.append(target)
+        adc = torch.clamp(torch.sub(torch.from_numpy(tree["adc"]).type(torch.float32), 75), min=0).view(-1, 21, 21)
+        layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(21, 21), dims=0)
+        ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(21, 21), dims=0)
+        self.input = torch.stack((adc, layer, ztan), dim=1)
+        self.target = torch.clamp(torch.mul(torch.from_numpy(tree["gedep"]).type(torch.float32), 1e6), max=10).view(-1, 21, 21)
 
     def __len__(self):
-        return self.n
+        return len(self.target)
 
     def __getitem__(self, idx):
         input = self.input[idx]
@@ -159,7 +153,7 @@ def main():
             file.name.endswith(".root") and
             file.is_file()):
             files.append(file.path + ":T")
-    nfiles = len(files)
+    nfiles = min(args.nfiles, len(files))
 
     sets_trained = 0
     model = Net().to(device)
@@ -175,7 +169,9 @@ def main():
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for iset in range(sets_trained, nfiles, args.data_size):
-        dataset = Data(files[iset:min(iset+args.data_size,args.nfiles,nfiles)])
+        ilast = min(iset + args.data_size, nfiles)
+        print(f"\nDataset: {iset + 1} to {ilast}\n")
+        dataset = Data(files[iset:ilast])
         nevents = len(dataset)
         ntrain = int(nevents*0.9)
         ntest = nevents - ntrain
@@ -188,7 +184,7 @@ def main():
             scheduler.step()
         if args.save_checkpoint:
             print("\nSaving checkpoint\n")
-            torch.save({'sets_trained': min(iset+args.data_size,args.nfiles,nfiles),
+            torch.save({'sets_trained': ilast,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         }, "save/checkpoint")
