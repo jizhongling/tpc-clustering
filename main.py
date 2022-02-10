@@ -13,11 +13,11 @@ from torch.utils.data import Dataset, DataLoader, random_split
 class Data(Dataset):
     def __init__(self, files):
         tree = ur.concatenate(files, ["adc", "layer", "ztan", "gedep"], library='np')
-        adc = torch.clamp(torch.sub(torch.from_numpy(tree["adc"]).type(torch.float32), 75), min=0).view(-1, 21, 21)
-        layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(21, 21), dims=0)
-        ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(21, 21), dims=0)
+        adc = torch.from_numpy(tree["adc"]).view(-1, 21, 21)[:, 7:14, 7:14].type(torch.float32).sub(75).clamp(min=0)
+        layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(7, 7), dims=0)
+        ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(7, 7), dims=0)
         self.input = torch.stack((adc, layer, ztan), dim=1)
-        self.target = torch.clamp(torch.mul(torch.from_numpy(tree["gedep"]).type(torch.float32), 1e6), max=10).view(-1, 21, 21)
+        self.target = torch.from_numpy(tree["gedep"]).view(-1, 21, 21)[:, 7:14, 7:14].type(torch.float32).mul(1e6).clamp(max=10)
 
     def __len__(self):
         return len(self.target)
@@ -35,8 +35,8 @@ class Net(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(64*81, 128)
-        self.fc2 = nn.Linear(128, 21*21)
+        self.fc1 = nn.Linear(64*4, 128)
+        self.fc2 = nn.Linear(128, 7*7)
         self.norm1 = nn.BatchNorm2d(32)
         self.norm2 = nn.BatchNorm2d(64)
         self.norm3 = nn.BatchNorm1d(128)
@@ -50,13 +50,13 @@ class Net(nn.Module):
         x = F.relu(x)
         x = F.max_pool2d(x, 2, ceil_mode=True)
         x = self.dropout1(x)
-        x = torch.flatten(x, start_dim=1)
+        x = x.flatten(start_dim=1)
         x = self.fc1(x)
         x = self.norm3(x)
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        output = torch.clamp(x, min=0, max=10).view(-1, 21, 21)
+        output = x.view(-1, 7, 7).clamp(min=0, max=10)
         return output
 
 
@@ -76,7 +76,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(model, device, test_loader):
+def test(model, device, test_loader, print_output):
     model.eval()
     test_loss = 0
     correct = 0
@@ -87,16 +87,20 @@ def test(model, device, test_loader):
             # sum up batch loss for all elements
             test_loss += F.mse_loss(output, target, reduction='sum').item()
             # get the index of the peak
-            pred = output.argmax(dim=2)
-            refs = target.argmax(dim=2)
+            pred = output.flatten(start_dim=1).argmax(dim=1)
+            refs = target.flatten(start_dim=1).argmax(dim=1)
             correct += pred.eq(refs).sum().item()
+            if print_output:
+                print(output, "\n\n\n", target)
+                print_output = False
 
     # mean batch loss for each element
-    test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].view(-1))
+    test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
 
     print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-        test_loss, correct, len(test_loader.dataset) * len(test_loader.dataset[0][1]),
-        100. * correct / len(test_loader.dataset) / len(test_loader.dataset[0][1])))
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
+    return print_output
 
 
 def main():
@@ -122,6 +126,10 @@ def main():
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=400, metavar='N',
                         help='how many batches to wait before logging training status')
+    parser.add_argument('--save-interval', type=int, default=10, metavar='N',
+                        help='how many groups of dataset to wait before saving the checkpoint')
+    parser.add_argument('--print', action='store_true', default=False,
+                        help='print output')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='save the current model')
     parser.add_argument('--load-model', action='store_true', default=False,
@@ -155,7 +163,9 @@ def main():
             files.append(file.path + ":T")
     nfiles = min(args.nfiles, len(files))
 
+    epochs_trained = 0
     sets_trained = 0
+    print_output = False
     model = Net().to(device)
     if args.load_model:
         model.load_state_dict(torch.load("save/net_weights.pt"))
@@ -163,40 +173,45 @@ def main():
     if args.load_checkpoint:
         print("\nLoading checkpoint\n")
         checkpoint = torch.load("save/checkpoint")
+        epochs_trained = checkpoint['epochs_trained']
         sets_trained = checkpoint['sets_trained']
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    for iset in range(sets_trained, nfiles, args.data_size):
-        ilast = min(iset + args.data_size, nfiles)
-        print(f"\nDataset: {iset + 1} to {ilast}\n")
-        dataset = Data(files[iset:ilast])
-        nevents = len(dataset)
-        ntrain = int(nevents*0.9)
-        ntest = nevents - ntrain
-        train_set, test_set = random_split(dataset, [ntrain, ntest])
-        train_loader = DataLoader(train_set, **train_kwargs)
-        test_loader = DataLoader(test_set, **test_kwargs)
-        for epoch in range(1, args.epochs + 1):
+    for epoch in range(epochs_trained + 1, args.epochs + 1):
+        for iset in range(sets_trained, nfiles, args.data_size):
+            ilast = min(iset + args.data_size, nfiles)
+            print(f"\nDataset: {iset + 1} to {ilast}\n")
+            dataset = Data(files[iset:ilast])
+            nevents = len(dataset)
+            ntrain = int(nevents*0.9)
+            ntest = nevents - ntrain
+            train_set, test_set = random_split(dataset, [ntrain, ntest])
+            train_loader = DataLoader(train_set, **train_kwargs)
+            test_loader = DataLoader(test_set, **test_kwargs)
             train(args, model, device, train_loader, optimizer, epoch)
-            test(model, device, test_loader)
+            print_output = test(model, device, test_loader, print_output)
             scheduler.step()
-        if args.save_checkpoint:
-            print("\nSaving checkpoint\n")
-            torch.save({'sets_trained': ilast,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        }, "save/checkpoint")
+            if (ilast - sets_trained) / args.data_size % args.save_interval == 0 or ilast == nfiles:
+                if args.save_checkpoint:
+                    print("\nSaving checkpoint\n")
+                    torch.save({'epochs_trained': epoch,
+                                'sets_trained': ilast,
+                                'model_state_dict': model.state_dict(),
+                                'optimizer_state_dict': optimizer.state_dict(),
+                                }, "save/checkpoint")
+                if args.print:
+                    print_output = True
 
     if args.save_model:
         model.cpu()
         model.eval()
-        example = torch.rand(1, 3, 21, 21)
+        example = torch.rand(1, 3, 7, 7)
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save("save/net_model.pt")
         torch.save(model.state_dict(), "save/net_weights.pt")
-        example = torch.ones(1, 3, 21, 21)
+        example = torch.ones(1, 3, 7, 7)
         print(model(example))
 
 
