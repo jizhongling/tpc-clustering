@@ -1,7 +1,9 @@
 from __future__ import print_function
 import argparse
 import os
+import numpy as np
 import uproot as ur
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +19,10 @@ class Data(Dataset):
         layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(7, 7), dims=0)
         ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(7, 7), dims=0)
         self.input = torch.stack((adc, layer, ztan), dim=1)
-        self.target = torch.from_numpy(tree["gedep"]).view(-1, 21, 21)[:, 7:14, 7:14].type(torch.float32).mul(1e6).clamp(max=10)
+        max_ind = torch.from_numpy(tree["gedep"]).view(-1, 21, 21)[:, 7:14, 7:14].flatten(start_dim=1).argmax(dim=1)
+        max_col = max_ind.fmod(7)
+        max_row = max_ind.sub(max_col).div(7)
+        self.target = torch.stack((max_row, max_col), dim=1).type(torch.float32)
 
     def __len__(self):
         return len(self.target)
@@ -36,7 +41,7 @@ class Net(nn.Module):
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(64*4, 128)
-        self.fc2 = nn.Linear(128, 7*7)
+        self.fc2 = nn.Linear(128, 2)
         self.norm1 = nn.BatchNorm2d(32)
         self.norm2 = nn.BatchNorm2d(64)
         self.norm3 = nn.BatchNorm1d(128)
@@ -56,7 +61,7 @@ class Net(nn.Module):
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        output = x.view(-1, 7, 7).clamp(min=0, max=10)
+        output = x
         return output
 
 
@@ -76,7 +81,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(model, device, test_loader, print_output):
+def test(model, device, test_loader, h2_diff, print_output):
     model.eval()
     test_loss = 0
     correct = 0
@@ -86,12 +91,23 @@ def test(model, device, test_loader, print_output):
             output = model(data)
             # sum up batch loss for all elements
             test_loss += F.mse_loss(output, target, reduction='sum').item()
+            diff_ind = output.sub(target).cpu().detach().numpy()
+            h2, xedges, yedges = np.histogram2d(diff_ind[:,0], diff_ind[:,1], bins=11, range=[[-5.5, 5.5], [-5.5, 5.5]])
+            h2_diff = np.add(h2_diff, h2)
             # get the index of the peak
-            pred = output.flatten(start_dim=1).argmax(dim=1)
-            refs = target.flatten(start_dim=1).argmax(dim=1)
+            output_ind = torch.round(output).clamp(min=0, max=6)
+            pred = output_ind[:,0].mul(7).add(output_ind[:,1])
+            refs = target[:,0].mul(7).add(target[:,1])
             correct += pred.eq(refs).sum().item()
             if print_output:
-                print(output, "\n\n\n", target)
+                fig = plt.figure(figsize=(11, 11))
+                ax = plt.axes()
+                ax.set(xlabel=r"$\Delta\phi$ (bins)")
+                ax.set(ylabel=r"$\Delta z$ (bins)")
+                map = ax.imshow(h2_diff, interpolation='nearest', origin='lower',
+                                extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
+                fig.colorbar(map, ax=ax)
+                plt.savefig("save/diff_ind.png")
                 print_output = False
 
     # mean batch loss for each element
@@ -100,7 +116,7 @@ def test(model, device, test_loader, print_output):
     print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
-    return print_output
+    return h2_diff, print_output
 
 
 def main():
@@ -125,9 +141,9 @@ def main():
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=400, metavar='N',
-                        help='how many batches to wait before logging training status')
+                        help='how many batches to wait before logging training status (default: 400)')
     parser.add_argument('--save-interval', type=int, default=10, metavar='N',
-                        help='how many groups of dataset to wait before saving the checkpoint')
+                        help='how many groups of dataset to wait before saving the checkpoint (default: 10)')
     parser.add_argument('--print', action='store_true', default=False,
                         help='print output')
     parser.add_argument('--save-model', action='store_true', default=False,
@@ -165,6 +181,7 @@ def main():
 
     epochs_trained = 0
     sets_trained = 0
+    h2_diff = np.zeros((11, 11), dtype=np.int64)
     print_output = False
     model = Net().to(device)
     if args.load_model:
@@ -191,7 +208,7 @@ def main():
             train_loader = DataLoader(train_set, **train_kwargs)
             test_loader = DataLoader(test_set, **test_kwargs)
             train(args, model, device, train_loader, optimizer, epoch)
-            print_output = test(model, device, test_loader, print_output)
+            h2_diff, print_output = test(model, device, test_loader, h2_diff, print_output)
             scheduler.step()
             if (ilast - sets_trained) / args.data_size % args.save_interval == 0 or ilast == nfiles:
                 if args.save_checkpoint:
