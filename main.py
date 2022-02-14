@@ -81,7 +81,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(model, device, test_loader, h2_diff, print_output):
+def test(args, model, device, test_loader, h2_diff, print_output):
     model.eval()
     test_loss = 0
     correct = 0
@@ -91,14 +91,16 @@ def test(model, device, test_loader, h2_diff, print_output):
             output = model(data)
             # sum up batch loss for all elements
             test_loss += F.mse_loss(output, target, reduction='sum').item()
-            diff_ind = output.sub(target).cpu().detach().numpy()
-            h2, xedges, yedges = np.histogram2d(diff_ind[:,0], diff_ind[:,1], bins=11, range=[[-5.5, 5.5], [-5.5, 5.5]])
-            h2_diff = np.add(h2_diff, h2)
             # get the index of the peak
             output_ind = torch.round(output).clamp(min=0, max=6)
             pred = output_ind[:,0].mul(7).add(output_ind[:,1])
             refs = target[:,0].mul(7).add(target[:,1])
             correct += pred.eq(refs).sum().item()
+            # make histogram for the index difference
+            if args.print:
+                diff_ind = output.sub(target).cpu().detach().numpy()
+                h2, xedges, yedges = np.histogram2d(diff_ind[:,0], diff_ind[:,1], bins=11, range=[[-5.5, 5.5], [-5.5, 5.5]])
+                h2_diff = np.add(h2_diff, h2)
             if print_output:
                 fig = plt.figure(figsize=(11, 11))
                 ax = plt.axes()
@@ -208,13 +210,13 @@ def main():
             train_loader = DataLoader(train_set, **train_kwargs)
             test_loader = DataLoader(test_set, **test_kwargs)
             train(args, model, device, train_loader, optimizer, epoch)
-            h2_diff, print_output = test(model, device, test_loader, h2_diff, print_output)
+            h2_diff, print_output = test(args, model, device, test_loader, h2_diff, print_output)
             scheduler.step()
             if (ilast - sets_trained) / args.data_size % args.save_interval == 0 or ilast == nfiles:
                 if args.save_checkpoint:
                     print("\nSaving checkpoint\n")
-                    torch.save({'epochs_trained': epoch,
-                                'sets_trained': ilast,
+                    torch.save({'epochs_trained': epoch if ilast == nfiles else epoch - 1,
+                                'sets_trained': 0 if ilast == nfiles else ilast,
                                 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
                                 }, "save/checkpoint")
