@@ -14,15 +14,13 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 class Data(Dataset):
     def __init__(self, files):
-        tree = ur.concatenate(files, ["adc", "layer", "ztan", "gedep"], library='np')
-        adc = torch.from_numpy(tree["adc"]).view(-1, 21, 21)[:, 7:14, 7:14].type(torch.float32).sub(75).clamp(min=0)
-        layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(7, 7), dims=0)
-        ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(7, 7), dims=0)
+        tree = ur.concatenate(files, ["adc", "layer", "ztan", "ntruth", "nreco"], library='np')
+        adc = torch.from_numpy(tree["adc"]).view(-1, 11, 11).type(torch.float32).sub(75).clamp(min=0)
+        layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(11, 11), dims=0)
+        ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(11, 11), dims=0)
         self.input = torch.stack((adc, layer, ztan), dim=1)
-        max_ind = torch.from_numpy(tree["gedep"]).view(-1, 21, 21)[:, 7:14, 7:14].flatten(start_dim=1).argmax(dim=1)
-        max_col = max_ind.fmod(7)
-        max_row = max_ind.sub(max_col).div(7)
-        self.target = torch.stack((max_row, max_col), dim=1).type(torch.float32)
+        self.target = torch.from_numpy(tree["ntruth"])[:, 5:].type(torch.int64).sum(dim=1).clamp(max=3)
+        self.comp = torch.from_numpy(tree["nreco"])[:, 2:].type(torch.int64).sum(dim=1).clamp(max=3)
 
     def __len__(self):
         return len(self.target)
@@ -30,7 +28,8 @@ class Data(Dataset):
     def __getitem__(self, idx):
         input = self.input[idx]
         target = self.target[idx]
-        return input, target
+        comp = self.comp[idx]
+        return input, target, comp
 
 
 class Net(nn.Module):
@@ -40,8 +39,8 @@ class Net(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(64*4, 128)
-        self.fc2 = nn.Linear(128, 2)
+        self.fc1 = nn.Linear(64*16, 128)
+        self.fc2 = nn.Linear(128, 4)
         self.norm1 = nn.BatchNorm2d(32)
         self.norm2 = nn.BatchNorm2d(64)
         self.norm3 = nn.BatchNorm1d(128)
@@ -61,56 +60,57 @@ class Net(nn.Module):
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        output = x
+        output = F.log_softmax(x, dim=1)
         return output
 
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
+    for batch_idx, (data, target, _) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
         # mean batch loss for each element
-        loss = F.mse_loss(output, target)
+        loss = F.nll_loss(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print("Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
+                epoch + 1, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(args, model, device, test_loader, h2_diff, print_output):
+def test(args, model, device, test_loader, h_diff, h_comp, print_output):
     model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
+        for data, target, comp in test_loader:
+            data, target, comp = data.to(device), target.to(device), comp.to(device)
             output = model(data)
             # sum up batch loss for all elements
-            test_loss += F.mse_loss(output, target, reduction='sum').item()
-            # get the index of the peak
-            output_ind = torch.round(output).clamp(min=0, max=6)
-            pred = output_ind[:,0].mul(7).add(output_ind[:,1])
-            refs = target[:,0].mul(7).add(target[:,1])
+            test_loss += F.nll_loss(output, target, reduction='sum').item()
+            # get the index of the max log-probability
+            pred = output.argmax(dim=1)
+            refs = target.view_as(pred)
             correct += pred.eq(refs).sum().item()
-            # make histogram for the index difference
+            # make histogram for the difference
             if args.print:
-                diff_ind = output.sub(target).cpu().detach().numpy()
-                h2, xedges, yedges = np.histogram2d(diff_ind[:,0], diff_ind[:,1], bins=11, range=[[-5.5, 5.5], [-5.5, 5.5]])
-                h2_diff = np.add(h2_diff, h2)
+                diff = pred.sub(refs).cpu().detach().numpy()
+                hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
+                h_diff = np.add(h_diff, hist)
+                diff = comp.sub(refs).cpu().detach().numpy()
+                hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
+                h_comp = np.add(h_comp, hist)
             if print_output:
-                fig = plt.figure(figsize=(11, 11))
-                ax = plt.axes()
-                ax.set(xlabel=r"$\Delta\phi$ (bins)")
-                ax.set(ylabel=r"$\Delta z$ (bins)")
-                map = ax.imshow(h2_diff, interpolation='nearest', origin='lower',
-                                extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
-                fig.colorbar(map, ax=ax)
-                plt.savefig("save/diff_ind.png")
                 print_output = False
+                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                plt.clf()
+                plt.xlabel(r"$\Delta N$")
+                plt.plot(bin_centers, h_diff, drawstyle='steps-mid', label='NN')
+                plt.plot(bin_centers, h_comp, drawstyle='steps-mid', label='reco')
+                plt.legend()
+                plt.savefig("save/diff.png")
 
     # mean batch loss for each element
     test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
@@ -118,7 +118,7 @@ def test(args, model, device, test_loader, h2_diff, print_output):
     print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
-    return h2_diff, print_output
+    return h_diff, h_comp, print_output
 
 
 def main():
@@ -183,7 +183,8 @@ def main():
 
     epochs_trained = 0
     sets_trained = 0
-    h2_diff = np.zeros((11, 11), dtype=np.int64)
+    h_diff = np.zeros(9, dtype=np.int64)
+    h_comp = np.zeros(9, dtype=np.int64)
     print_output = False
     model = Net().to(device)
     if args.load_model:
@@ -198,7 +199,7 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
-    for epoch in range(epochs_trained + 1, args.epochs + 1):
+    for epoch in range(epochs_trained, args.epochs):
         for iset in range(sets_trained, nfiles, args.data_size):
             ilast = min(iset + args.data_size, nfiles)
             print(f"\nDataset: {iset + 1} to {ilast}\n")
@@ -210,12 +211,12 @@ def main():
             train_loader = DataLoader(train_set, **train_kwargs)
             test_loader = DataLoader(test_set, **test_kwargs)
             train(args, model, device, train_loader, optimizer, epoch)
-            h2_diff, print_output = test(args, model, device, test_loader, h2_diff, print_output)
+            h_diff, h_comp, print_output = test(args, model, device, test_loader, h_diff, h_comp, print_output)
             scheduler.step()
             if (ilast - sets_trained) / args.data_size % args.save_interval == 0 or ilast == nfiles:
                 if args.save_checkpoint:
                     print("\nSaving checkpoint\n")
-                    torch.save({'epochs_trained': epoch if ilast == nfiles else epoch - 1,
+                    torch.save({'epochs_trained': epoch + 1 if ilast == nfiles else epoch,
                                 'sets_trained': 0 if ilast == nfiles else ilast,
                                 'model_state_dict': model.state_dict(),
                                 'optimizer_state_dict': optimizer.state_dict(),
