@@ -13,14 +13,34 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 
 class Data(Dataset):
-    def __init__(self, files):
-        tree = ur.concatenate(files, ["adc", "layer", "ztan", "ntruth", "nreco"], library='np')
-        adc = torch.from_numpy(tree["adc"]).view(-1, 11, 11).type(torch.float32).sub(75).clamp(min=0)
-        layer = torch.tensordot(torch.from_numpy(tree["layer"]).type(torch.float32), torch.ones(11, 11), dims=0)
-        ztan = torch.tensordot(torch.from_numpy(tree["ztan"]).type(torch.float32), torch.ones(11, 11), dims=0)
+    def __init__(self, args, files):
+        branch = ["adc", "layer", "ztan"]
+        if args.type == 0:
+            branch += ["ntruth", "nreco"]
+        else:
+            branch += ["truth_phi", "truth_z", "truth_edep", "reco_phi", "reco_z", "reco_adc"]
+        tree = ur.concatenate(files, branch, library='np')
+        if args.type == 0:
+            self.target = torch.from_numpy(tree["ntruth"])[:, 5:].type(torch.int64).sum(dim=1).clamp(max=3)
+            self.comp = torch.from_numpy(tree["nreco"])[:, 2:].type(torch.int64).sum(dim=1).clamp(max=3)
+            batch_ind = torch.arange(len(self.target))
+        else:
+            e = torch.from_numpy(tree["truth_edep"])
+            ind = torch.where(e > 4e-7)
+            batch_ind = torch.where(ind[0].bincount() == args.type)
+            batch_si = torch.tensordot(batch_ind[0], torch.ones(args.type).type(torch.int64), dims=0).flatten()
+            si = e[batch_ind].argsort(dim=1, descending=True)[:, :args.type].flatten()
+            phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].view(-1, args.type).type(torch.float32)
+            z = torch.from_numpy(tree["truth_z"])[batch_si, si].view(-1, args.type).type(torch.float32)
+            self.target = torch.stack((phi, z), dim=1)
+            ind = torch.where(torch.from_numpy(tree["reco_adc"])[batch_ind] > 40)
+            phi = torch.from_numpy(tree["reco_phi"])[batch_ind][ind].type(torch.float32)
+            z = torch.from_numpy(tree["reco_z"])[batch_ind][ind].type(torch.float32)
+            self.comp = torch.stack((phi, z), dim=1)
+        adc = torch.from_numpy(tree["adc"])[batch_ind].view(-1, 11, 11).type(torch.float32).sub(75).clamp(min=0)
+        layer = torch.tensordot(torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32), torch.ones(11, 11), dims=0)
+        ztan = torch.tensordot(torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32), torch.ones(11, 11), dims=0)
         self.input = torch.stack((adc, layer, ztan), dim=1)
-        self.target = torch.from_numpy(tree["ntruth"])[:, 5:].type(torch.int64).sum(dim=1).clamp(max=3)
-        self.comp = torch.from_numpy(tree["nreco"])[:, 2:].type(torch.int64).sum(dim=1).clamp(max=3)
 
     def __len__(self):
         return len(self.target)
@@ -33,14 +53,19 @@ class Data(Dataset):
 
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, args):
         super(Net, self).__init__()
+        self.type = args.type
+        if self.type == 0:
+            nout = 4
+        else:
+            nout = self.type * 2
         self.conv1 = nn.Conv2d(3, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(64*16, 128)
-        self.fc2 = nn.Linear(128, 4)
+        self.fc2 = nn.Linear(128, nout)
         self.norm1 = nn.BatchNorm2d(32)
         self.norm2 = nn.BatchNorm2d(64)
         self.norm3 = nn.BatchNorm1d(128)
@@ -60,7 +85,10 @@ class Net(nn.Module):
         x = F.relu(x)
         x = self.dropout2(x)
         x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
+        if self.type == 0:
+            output = F.log_softmax(x, dim=1)
+        else:
+            output = x.view(-1, 2, self.type)
         return output
 
 
@@ -71,7 +99,10 @@ def train(args, model, device, train_loader, optimizer, epoch):
         optimizer.zero_grad()
         output = model(data)
         # mean batch loss for each element
-        loss = F.nll_loss(output, target)
+        if args.type == 0:
+            loss = F.nll_loss(output, target)
+        else:
+            loss = F.mse_loss(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -89,28 +120,31 @@ def test(args, model, device, test_loader, h_diff, h_comp, print_output):
             data, target, comp = data.to(device), target.to(device), comp.to(device)
             output = model(data)
             # sum up batch loss for all elements
-            test_loss += F.nll_loss(output, target, reduction='sum').item()
-            # get the index of the max log-probability
-            pred = output.argmax(dim=1)
-            refs = target.view_as(pred)
-            correct += pred.eq(refs).sum().item()
-            # make histogram for the difference
-            if args.print:
-                diff = pred.sub(refs).cpu().detach().numpy()
-                hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
-                h_diff = np.add(h_diff, hist)
-                diff = comp.sub(refs).cpu().detach().numpy()
-                hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
-                h_comp = np.add(h_comp, hist)
-            if print_output:
-                print_output = False
-                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-                plt.clf()
-                plt.xlabel(r"$\Delta N$")
-                plt.plot(bin_centers, h_diff, drawstyle='steps-mid', label='NN')
-                plt.plot(bin_centers, h_comp, drawstyle='steps-mid', label='reco')
-                plt.legend()
-                plt.savefig("save/diff.png")
+            if args.type == 0:
+                test_loss += F.nll_loss(output, target, reduction='sum').item()
+                # get the index of the max log-probability
+                pred = output.argmax(dim=1)
+                refs = target.view_as(pred)
+                correct += pred.eq(refs).sum().item()
+                # make histogram for the difference
+                if args.print:
+                    diff = pred.sub(refs).cpu().detach().numpy()
+                    hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
+                    h_diff = np.add(h_diff, hist)
+                    diff = comp.sub(refs).cpu().detach().numpy()
+                    hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
+                    h_comp = np.add(h_comp, hist)
+                if print_output:
+                    print_output = False
+                    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                    plt.clf()
+                    plt.xlabel(r"$\Delta N$")
+                    plt.plot(bin_centers, h_diff, drawstyle='steps-mid', label='NN')
+                    plt.plot(bin_centers, h_comp, drawstyle='steps-mid', label='reco')
+                    plt.legend()
+                    plt.savefig("save/diff.png")
+            else:
+                test_loss += F.mse_loss(output, target, reduction='sum').item()
 
     # mean batch loss for each element
     test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
@@ -124,6 +158,8 @@ def test(args, model, device, test_loader, h_diff, h_comp, print_output):
 def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
+    parser.add_argument('--type', type=int, default=0, metavar='N',
+                        help='training type (ntruth: 0, position > 0, default: 0)')
     parser.add_argument('--nfiles', type=int, default=10000, metavar='N',
                         help='max number of files used for training (default: 10000)')
     parser.add_argument('--data-size', type=int, default=1, metavar='N',
@@ -186,7 +222,7 @@ def main():
     h_diff = np.zeros(9, dtype=np.int64)
     h_comp = np.zeros(9, dtype=np.int64)
     print_output = False
-    model = Net().to(device)
+    model = Net(args).to(device)
     if args.load_model:
         model.load_state_dict(torch.load("save/net_weights.pt"))
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
@@ -203,7 +239,7 @@ def main():
         for iset in range(sets_trained, nfiles, args.data_size):
             ilast = min(iset + args.data_size, nfiles)
             print(f"\nDataset: {iset + 1} to {ilast}\n")
-            dataset = Data(files[iset:ilast])
+            dataset = Data(args, files[iset:ilast])
             nevents = len(dataset)
             ntrain = int(nevents*0.9)
             ntest = nevents - ntrain
@@ -227,11 +263,11 @@ def main():
     if args.save_model:
         model.cpu()
         model.eval()
-        example = torch.rand(1, 3, 7, 7)
+        example = torch.randn(1, 3, 11, 11)
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save("save/net_model.pt")
         torch.save(model.state_dict(), "save/net_weights.pt")
-        example = torch.ones(1, 3, 7, 7)
+        example = torch.ones(1, 3, 11, 11)
         print(model(example))
 
 
