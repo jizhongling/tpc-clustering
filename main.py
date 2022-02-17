@@ -22,31 +22,31 @@ class Data(Dataset):
             branch += ["truth_phi", "truth_z", "truth_edep", "reco_phi", "reco_z", "reco_adc"]
         tree = ur.concatenate(files, branch, library='np')
         if args.type == 0:
-            self.target = torch.from_numpy(tree["ntruth"])[:, 5:].type(torch.int64).sum(dim=1).clamp(max=5)
-            self.comp = torch.from_numpy(tree["nreco"])[:, 2:].type(torch.int64).sum(dim=1).clamp(max=5)
+            self.target = torch.from_numpy(tree["ntruth"])[:, 6:].type(torch.int64).sum(dim=1).clamp(max=5)
+            self.comp = torch.from_numpy(tree["nreco"])[:, 4:].type(torch.int64).sum(dim=1).clamp(max=5)
             batch_ind = torch.arange(len(self.target))
         else:
             e = torch.from_numpy(tree["truth_edep"])
-            ind = torch.where(e > 4e-7)
+            ind = torch.where(e > 1.2e-6)
             batch_ind = torch.where(ind[0].bincount() == args.type)[0]
-            batch_si = torch.tensordot(batch_ind, torch.ones(args.type, dtype=torch.int64), dims=0).flatten()
+            batch_si = batch_ind.unsqueeze(1).expand(-1, args.type).flatten()
             si = e[batch_ind].argsort(dim=1, descending=True)[:, :args.type].flatten()
-            phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].view(-1, args.type).type(torch.float32)
-            z = torch.from_numpy(tree["truth_z"])[batch_si, si].view(-1, args.type).type(torch.float32)
+            phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].type(torch.float32).view(-1, args.type)
+            z = torch.from_numpy(tree["truth_z"])[batch_si, si].type(torch.float32).view(-1, args.type)
             self.target = torch.stack((phi, z), dim=1)
             si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.type].flatten()
-            phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].view(-1, args.type).type(torch.float32)
-            z = torch.from_numpy(tree["reco_z"])[batch_si, si].view(-1, args.type).type(torch.float32)
+            phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.type)
+            z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.type)
             self.comp = torch.stack((phi, z), dim=1)
         if args.use_conv:
-            adc = torch.from_numpy(tree["adc"])[batch_ind].view(-1, 11, 11).type(torch.float32).sub(75).clamp(min=0)
-            layer = torch.tensordot(torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32), torch.ones(11, 11), dims=0)
-            ztan = torch.tensordot(torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32), torch.ones(11, 11), dims=0)
+            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11).sub(75).clamp(min=0)
+            layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
+            ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
             self.input = torch.stack((adc, layer, ztan), dim=1)
         else:
             adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).sub(75).clamp(min=0)
-            layer = torch.from_numpy(tree["layer"])[batch_ind].unsqueeze(1).type(torch.float32)
-            ztan = torch.from_numpy(tree["ztan"])[batch_ind].unsqueeze(1).type(torch.float32)
+            layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).unsqueeze(1)
+            ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).unsqueeze(1)
             self.input = torch.cat((adc, layer, ztan), dim=1)
 
     def __len__(self):
@@ -208,8 +208,8 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
                             axs2[itype].set(ylabel=r"$\Delta z$ (binsize)")
                             axs2[itype].set(title=f"reco: No. {itype + 1} highest energy")
                         fig.tight_layout()
-                        plt.savefig("save/diff_position.png")
-                        print("\nFigure saved to save/diff_position.png")
+                        plt.savefig(f"save/diff_position-type{args.type}.png")
+                        print(f"\nFigure saved to save/diff_position-type{args.type}.png")
 
     # mean batch loss for each element
     test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
@@ -245,8 +245,8 @@ def main():
                         help='disables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=400, metavar='N',
-                        help='how many batches to wait before logging training status (default: 400)')
+    parser.add_argument('--log-interval', type=int, default=800, metavar='N',
+                        help='how many batches to wait before logging training status (default: 800)')
     parser.add_argument('--save-interval', type=int, default=10, metavar='N',
                         help='how many groups of dataset to wait before saving the checkpoint (default: 10)')
     parser.add_argument('--print', action='store_true', default=False,
@@ -299,11 +299,11 @@ def main():
     model = Net(args).to(device)
     if args.load_model:
         print("\nLoading model\n")
-        model.load_state_dict(torch.load("save/net_weights.pt"))
+        model.load_state_dict(torch.load(f"save/net_weights-type{args.type}.pt"))
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     if args.load_checkpoint:
         print("\nLoading checkpoint\n")
-        checkpoint = torch.load("save/checkpoint")
+        checkpoint = torch.load(f"save/checkpoint-type{args.type}")
         epochs_trained = checkpoint['epochs_trained']
         sets_trained = checkpoint['sets_trained']
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -331,7 +331,7 @@ def main():
                             'sets_trained': 0 if ilast == nfiles else ilast,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                            }, "save/checkpoint")
+                            }, f"save/checkpoint-type{args.type}")
 
     if args.save_model:
         model.cpu()
@@ -341,9 +341,9 @@ def main():
         else:
             example = torch.randn(1, 11*11+2)
         traced_script_module = torch.jit.trace(model, example)
-        traced_script_module.save("save/net_model.pt")
-        torch.save(model.state_dict(), "save/net_weights.pt")
-        print("\nSaved model to save/net_model.pt\n")
+        traced_script_module.save(f"save/net_model-type{args.type}.pt")
+        torch.save(model.state_dict(), f"save/net_weights-type{args.type}.pt")
+        print(f"\nModel saved to save/net_model-type{args.type}.pt\n")
 
 
 if __name__ == '__main__':
