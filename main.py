@@ -6,6 +6,7 @@ import uproot as ur
 import matplotlib.pyplot as plt
 from matplotlib import colors
 import torch
+import torch.linalg as LA
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -161,23 +162,17 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
                     diff = comp.sub(refs).detach().cpu().numpy()
                     hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
                     h_comp = np.add(h_comp, hist)
-                    if savenow:
-                        savenow = False
-                        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-                        plt.clf()
-                        plt.plot(bin_centers, h_diff, drawstyle='steps-mid', label='NN')
-                        plt.plot(bin_centers, h_comp, drawstyle='steps-mid', label='reco')
-                        plt.legend()
-                        plt.xlabel(r"$\Delta N$")
-                        plt.savefig("save/diff_ntruth.png")
-                        print("\nFigure saved to save/diff_ntruth.png")
             else:
                 # sum up batch loss for all elements
                 test_loss += F.mse_loss(output, target, reduction='sum').item()
+                # count the number of improved predictions
+                diff = output.sub(target)
+                diff_comp = comp.sub(target)
+                correct += (LA.matrix_norm(diff) < LA.matrix_norm(diff_comp)).sum().item()
                 if args.print:
                     # make histogram for the difference
-                    diff = output.sub(target).detach().cpu().numpy()
-                    diff_comp = comp.sub(target).detach().cpu().numpy()
+                    diff = diff.detach().cpu().numpy()
+                    diff_comp = diff_comp.detach().cpu().numpy()
                     for itype in range(args.type):
                         hist, xedges, yedges = np.histogram2d(diff[:, 0, itype], diff[:, 1, itype],
                                                               bins=50, range=[[-5, 5], [-5, 5]])
@@ -185,31 +180,6 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
                         hist, xedges, yedges = np.histogram2d(diff_comp[:, 0, itype], diff_comp[:, 1, itype],
                                                               bins=50, range=[[-5, 5], [-5, 5]])
                         h_comp[itype] = np.add(h_comp[itype], hist)
-                    if savenow:
-                        savenow = False
-                        plt.clf()
-                        fig, (axs1, axs2) = plt.subplots(2, args.type, figsize=(12, 12))
-                        if args.type == 1:
-                            axs1 = np.expand_dims(axs1, axis=0)
-                            axs2 = np.expand_dims(axs2, axis=0)
-                        for itype in range(args.type):
-                            im = axs1[itype].imshow(h_diff[itype], interpolation='nearest', origin='lower',
-                                                    extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-                                                    norm=colors.LogNorm())
-                            fig.colorbar(im, ax=axs1[itype], fraction=0.047)
-                            axs1[itype].set(xlabel=r"$\Delta\phi$ (binsize)")
-                            axs1[itype].set(ylabel=r"$\Delta z$ (binsize)")
-                            axs1[itype].set(title=f"NN: No. {itype + 1} highest energy")
-                            im = axs2[itype].imshow(h_comp[itype], interpolation='nearest', origin='lower',
-                                                    extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-                                                    norm=colors.LogNorm())
-                            fig.colorbar(im, ax=axs2[itype], fraction=0.047)
-                            axs2[itype].set(xlabel=r"$\Delta\phi$ (binsize)")
-                            axs2[itype].set(ylabel=r"$\Delta z$ (binsize)")
-                            axs2[itype].set(title=f"reco: No. {itype + 1} highest energy")
-                        fig.tight_layout()
-                        plt.savefig(f"save/diff_position-type{args.type}.png")
-                        print(f"\nFigure saved to save/diff_position-type{args.type}.png")
 
     # mean batch loss for each element
     test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
@@ -217,6 +187,39 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
     print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
+
+    if args.print and savenow:
+        plt.clf()
+        if args.type == 0:
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            plt.plot(bin_centers, h_diff, drawstyle='steps-mid', label='NN')
+            plt.plot(bin_centers, h_comp, drawstyle='steps-mid', label='reco')
+            plt.legend()
+            plt.xlabel(r"$\Delta N$")
+        else:
+            fig, (axs1, axs2) = plt.subplots(2, args.type, figsize=(12, 12))
+            if args.type == 1:
+                axs1 = np.expand_dims(axs1, axis=0)
+                axs2 = np.expand_dims(axs2, axis=0)
+            for itype in range(args.type):
+                im = axs1[itype].imshow(h_diff[itype], interpolation='nearest', origin='lower',
+                                        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                                        norm=colors.LogNorm())
+                fig.colorbar(im, ax=axs1[itype], fraction=0.047)
+                axs1[itype].set(xlabel=r"$\Delta\phi$ (binsize)")
+                axs1[itype].set(ylabel=r"$\Delta z$ (binsize)")
+                axs1[itype].set(title=f"NN: No. {itype + 1} highest energy")
+                im = axs2[itype].imshow(h_comp[itype], interpolation='nearest', origin='lower',
+                                        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                                        norm=colors.LogNorm())
+                fig.colorbar(im, ax=axs2[itype], fraction=0.047)
+                axs2[itype].set(xlabel=r"$\Delta\phi$ (binsize)")
+                axs2[itype].set(ylabel=r"$\Delta z$ (binsize)")
+                axs2[itype].set(title=f"reco: No. {itype + 1} highest energy")
+            fig.tight_layout()
+        plt.savefig(f"save/diff-type{args.type}.png")
+        print(f"\nFigure saved to save/diff-type{args.type}.png\n")
+
     return h_diff, h_comp
 
 
@@ -239,16 +242,16 @@ def main():
                         help='number of epochs to train (default: 10)')
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
-    parser.add_argument('--gamma', type=float, default=0.9, metavar='M',
-                        help='learning rate step gamma (default: 0.9)')
+    parser.add_argument('--gamma', type=float, default=0.5, metavar='M',
+                        help='learning rate step gamma (default: 0.5)')
     parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
+                        help='disable CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=800, metavar='N',
-                        help='how many batches to wait before logging training status (default: 800)')
-    parser.add_argument('--save-interval', type=int, default=10, metavar='N',
-                        help='how many groups of dataset to wait before saving the checkpoint (default: 10)')
+    parser.add_argument('--log-interval', type=int, default=400, metavar='N',
+                        help='how many batches to wait before logging training status (default: 400)')
+    parser.add_argument('--save-interval', type=int, default=5, metavar='N',
+                        help='how many groups of dataset to wait before saving the checkpoint (default: 5)')
     parser.add_argument('--print', action='store_true', default=False,
                         help='print output')
     parser.add_argument('--save-model', action='store_true', default=False,
@@ -265,7 +268,7 @@ def main():
     torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if use_cuda else "cpu")
-    print(f"Using {device} device")
+    print(f"\nUsing {device} device\n")
 
     train_kwargs = {'batch_size': args.batch_size}
     test_kwargs = {'batch_size': args.test_batch_size}
@@ -313,7 +316,7 @@ def main():
     for epoch in range(epochs_trained, args.epochs):
         for iset in range(sets_trained, nfiles, args.data_size):
             ilast = min(iset + args.data_size, nfiles)
-            savenow = (ilast - sets_trained) / args.data_size % args.save_interval == 0 or ilast == nfiles
+            savenow = ilast == nfiles or (ilast - sets_trained) // args.data_size % args.save_interval == 0
             print(f"\nDataset: {iset + 1} to {ilast}\n")
             dataset = Data(args, files[iset:ilast])
             nevents = len(dataset)
