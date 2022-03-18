@@ -1,5 +1,6 @@
 from __future__ import print_function
 import argparse
+import sys
 import os
 import numpy as np
 import uproot as ur
@@ -19,26 +20,46 @@ class Data(Dataset):
         branch = ["adc", "layer", "ztan"]
         if args.type == 0:
             branch += ["ntruth", "nreco"]
+        elif args.type == 1:
+            branch += ["truth_phi", "truth_z", "truth_adc", "reco_phi", "reco_z", "reco_adc"]
+        elif args.type == 2:
+            branch += ["truth_phicov", "truth_adc"]
+        elif args.type == 3:
+            branch += ["truth_zcov", "truth_adc"]
+        elif args.type == 4:
+            branch += ["truth_adc"]
         else:
-            branch += ["truth_phi", "truth_z", "truth_edep", "reco_phi", "reco_z", "reco_adc"]
+            sys.exit("\nError: Wrong type number\n")
         tree = ur.concatenate(files, branch, library='np')
+
+        self.has_comp = False
         if args.type == 0:
-            self.target = torch.from_numpy(tree["ntruth"])[:, 6:].type(torch.int64).sum(dim=1).clamp(max=5)
-            self.comp = torch.from_numpy(tree["nreco"])[:, 4:].type(torch.int64).sum(dim=1).clamp(max=5)
+            self.target = torch.from_numpy(tree["ntruth"])[:, 5:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
+            self.comp = torch.from_numpy(tree["nreco"])[:, 5:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
+            self.has_comp = True
             batch_ind = torch.arange(len(self.target))
         else:
-            e = torch.from_numpy(tree["truth_edep"])
-            ind = torch.where(e > 1.2e-6)
-            batch_ind = torch.where(ind[0].bincount() == args.type)[0]
-            batch_si = batch_ind.unsqueeze(1).expand(-1, args.type).flatten()
-            si = e[batch_ind].argsort(dim=1, descending=True)[:, :args.type].flatten()
-            phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].type(torch.float32).view(-1, args.type)
-            z = torch.from_numpy(tree["truth_z"])[batch_si, si].type(torch.float32).view(-1, args.type)
-            self.target = torch.stack((phi, z), dim=1)
-            si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.type].flatten()
-            phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.type)
-            z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.type)
-            self.comp = torch.stack((phi, z), dim=1)
+            gadc = torch.from_numpy(tree["truth_adc"])
+            ind = torch.where(gadc > 100)
+            batch_ind = torch.where(ind[0].bincount() == args.nout)[0]
+            batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
+            si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
+            if args.type == 1:
+                phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                z = torch.from_numpy(tree["truth_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                self.target = torch.stack((phi, z), dim=1)
+                si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
+                phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                self.comp = torch.stack((phi, z), dim=1)
+                self.has_comp = True
+            elif args.type == 2:
+                self.target = torch.from_numpy(tree["truth_phicov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+            elif args.type == 3:
+                self.target = torch.from_numpy(tree["truth_zcov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+            elif args.type == 4:
+                self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
+
         if args.use_conv:
             adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11).sub(75).clamp(min=0)
             layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
@@ -56,19 +77,28 @@ class Data(Dataset):
     def __getitem__(self, idx):
         input = self.input[idx]
         target = self.target[idx]
-        comp = self.comp[idx]
-        return input, target, comp
+        if self.has_comp:
+            return input, target, self.comp[idx]
+        else:
+            return input, target
 
 
 class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
         self.type = args.type
+        self.nout = args.nout
         self.use_conv = args.use_conv
+
         if self.type == 0:
-            nout = 6
+            nout = args.nmax + 1
+        elif self.type == 1:
+            nout = 2 * self.nout
+        elif self.type <= 4:
+            nout = self.nout
         else:
-            nout = 2 * self.type
+            sys.exit("\nError: Wrong type number\n")
+
         if self.use_conv:
             print("\nUsing convolutional neural network\n")
             self.conv1 = nn.Conv2d(3, 32, 3, 1)
@@ -112,17 +142,20 @@ class Net(nn.Module):
             x = self.norm2(x)
             x = torch.sigmoid(x)
             x = self.fc3(x)
+
         if self.type == 0:
             output = F.log_softmax(x, dim=1)
-        else:
-            output = x.view(-1, 2, self.type)
+        elif self.type == 1:
+            output = x.view(-1, 2, self.nout)
+        elif self.type <= 4:
+            output = x.view(-1, self.nout)
         return output
 
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
-    for batch_idx, (data, target, _) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
+    for batch_idx, item in enumerate(train_loader):
+        data, target = item[0].to(device), item[1].to(device)
         optimizer.zero_grad()
         output = model(data)
         if args.type == 0:
@@ -144,8 +177,12 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
     test_loss = 0
     correct = 0
     with torch.no_grad():
-        for data, target, comp in test_loader:
-            data, target, comp = data.to(device), target.to(device), comp.to(device)
+        for item in test_loader:
+            if len(item) >= 3:
+                data, target, comp = item[0].to(device), item[1].to(device), item[2].to(device)
+            else:
+                data, target = item[0].to(device), item[1].to(device)
+                args.print = False
             output = model(data)
             if args.type == 0:
                 # sum up batch loss for all elements
@@ -159,7 +196,7 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
                     diff = pred.sub(refs).detach().cpu().numpy()
                     hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
                     h_diff = np.add(h_diff, hist)
-                    diff = comp.sub(refs).detach().cpu().numpy()
+                    diff = comp.view_as(refs).sub(refs).detach().cpu().numpy()
                     hist, bin_edges = np.histogram(diff, bins=9, range=(-4.5, 4.5))
                     h_comp = np.add(h_comp, hist)
             else:
@@ -167,19 +204,24 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
                 test_loss += F.mse_loss(output, target, reduction='sum').item()
                 # count the number of improved predictions
                 diff = output.sub(target)
-                diff_comp = comp.sub(target)
-                correct += (LA.matrix_norm(diff) < LA.matrix_norm(diff_comp)).sum().item()
+                try:
+                    comp
+                except NameError:
+                    pass
+                else:
+                    diff_comp = comp.sub(target)
+                    correct += (LA.matrix_norm(diff) < LA.matrix_norm(diff_comp)).sum().item()
                 if args.print:
                     # make histogram for the difference
                     diff = diff.detach().cpu().numpy()
                     diff_comp = diff_comp.detach().cpu().numpy()
-                    for itype in range(args.type):
-                        hist, xedges, yedges = np.histogram2d(diff[:, 0, itype], diff[:, 1, itype],
+                    for iout in range(args.nout):
+                        hist, xedges, yedges = np.histogram2d(diff[:, 0, iout], diff[:, 1, iout],
                                                               bins=50, range=[[-5, 5], [-5, 5]])
-                        h_diff[itype] = np.add(h_diff[itype], hist)
-                        hist, xedges, yedges = np.histogram2d(diff_comp[:, 0, itype], diff_comp[:, 1, itype],
+                        h_diff[iout] = np.add(h_diff[iout], hist)
+                        hist, xedges, yedges = np.histogram2d(diff_comp[:, 0, iout], diff_comp[:, 1, iout],
                                                               bins=50, range=[[-5, 5], [-5, 5]])
-                        h_comp[itype] = np.add(h_comp[itype], hist)
+                        h_comp[iout] = np.add(h_comp[iout], hist)
 
     # mean batch loss for each element
     test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
@@ -197,28 +239,28 @@ def test(args, model, device, test_loader, h_diff, h_comp, savenow):
             plt.legend()
             plt.xlabel(r"$\Delta N$")
         else:
-            fig, (axs1, axs2) = plt.subplots(2, args.type, figsize=(12, 12))
-            if args.type == 1:
+            fig, (axs1, axs2) = plt.subplots(2, args.nout, figsize=(12, 12))
+            if args.nout == 1:
                 axs1 = np.expand_dims(axs1, axis=0)
                 axs2 = np.expand_dims(axs2, axis=0)
-            for itype in range(args.type):
-                im = axs1[itype].imshow(h_diff[itype], interpolation='nearest', origin='lower',
+            for iout in range(args.nout):
+                im = axs1[iout].imshow(h_diff[iout], interpolation='nearest', origin='lower',
                                         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                                         norm=colors.LogNorm())
-                fig.colorbar(im, ax=axs1[itype], fraction=0.047)
-                axs1[itype].set(xlabel=r"$\Delta\phi$ (binsize)")
-                axs1[itype].set(ylabel=r"$\Delta z$ (binsize)")
-                axs1[itype].set(title=f"NN: No. {itype + 1} highest energy")
-                im = axs2[itype].imshow(h_comp[itype], interpolation='nearest', origin='lower',
+                fig.colorbar(im, ax=axs1[iout], fraction=0.047)
+                axs1[iout].set(xlabel=r"$\Delta\phi$ (binsize)")
+                axs1[iout].set(ylabel=r"$\Delta z$ (binsize)")
+                axs1[iout].set(title=f"NN: No. {iout + 1} highest energy")
+                im = axs2[iout].imshow(h_comp[iout], interpolation='nearest', origin='lower',
                                         extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                                         norm=colors.LogNorm())
-                fig.colorbar(im, ax=axs2[itype], fraction=0.047)
-                axs2[itype].set(xlabel=r"$\Delta\phi$ (binsize)")
-                axs2[itype].set(ylabel=r"$\Delta z$ (binsize)")
-                axs2[itype].set(title=f"reco: No. {itype + 1} highest energy")
+                fig.colorbar(im, ax=axs2[iout], fraction=0.047)
+                axs2[iout].set(xlabel=r"$\Delta\phi$ (binsize)")
+                axs2[iout].set(ylabel=r"$\Delta z$ (binsize)")
+                axs2[iout].set(title=f"reco: No. {iout + 1} highest energy")
             fig.tight_layout()
-        plt.savefig(f"save/diff-type{args.type}.png")
-        print(f"\nFigure saved to save/diff-type{args.type}.png\n")
+        plt.savefig(f"save/diff-type{args.type}-nout{args.nout}.png")
+        print(f"\nFigure saved to save/diff-type{args.type}-nout{args.nout}.png\n")
 
     return h_diff, h_comp
 
@@ -227,13 +269,15 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, position > 0, default: 0)')
-    parser.add_argument('--use-conv', action='store_true', default=False,
-                        help='use convolutional neural network')
+                        help='training type (ntruth: 0, pos: 1, phicov: 2, zcov: 3, adc: 4, default: 0)')
+    parser.add_argument('--nout', type=int, default=1, metavar='N',
+                        help='number of output clusters (default: 1)')
+    parser.add_argument('--nmax', type=int, default=5, metavar='N',
+                        help='max number of output clusters (default: 5)')
     parser.add_argument('--nfiles', type=int, default=10000, metavar='N',
                         help='max number of files used for training (default: 10000)')
-    parser.add_argument('--data-size', type=int, default=3, metavar='N',
-                        help='number of files for each training (default: 3)')
+    parser.add_argument('--data-size', type=int, default=5, metavar='N',
+                        help='number of files for each training (default: 5)')
     parser.add_argument('--batch-size', type=int, default=256, metavar='N',
                         help='input batch size for training (default: 256)')
     parser.add_argument('--test-batch-size', type=int, default=1024, metavar='N',
@@ -244,6 +288,8 @@ def main():
                         help='learning rate (default: 1.0)')
     parser.add_argument('--gamma', type=float, default=0.5, metavar='M',
                         help='learning rate step gamma (default: 0.5)')
+    parser.add_argument('--use-conv', action='store_true', default=False,
+                        help='use convolutional neural network')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disable CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -290,10 +336,11 @@ def main():
     if args.type == 0:
         h_diff = np.zeros(9, dtype=np.int64)
         h_comp = np.zeros(9, dtype=np.int64)
+        args.nout = args.nmax
     else:
         h_diff = []
         h_comp = []
-        for _ in range(args.type):
+        for _ in range(args.nout):
             h_diff.append(np.zeros((50, 50), dtype=np.int64))
             h_comp.append(np.zeros((50, 50), dtype=np.int64))
 
@@ -302,11 +349,11 @@ def main():
     model = Net(args).to(device)
     if args.load_model:
         print("\nLoading model\n")
-        model.load_state_dict(torch.load(f"save/net_weights-type{args.type}.pt"))
+        model.load_state_dict(torch.load(f"save/net_weights-type{args.type}-nout{args.nout}.pt"))
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     if args.load_checkpoint:
         print("\nLoading checkpoint\n")
-        checkpoint = torch.load(f"save/checkpoint-type{args.type}")
+        checkpoint = torch.load(f"save/checkpoint-type{args.type}-nout{args.nout}")
         epochs_trained = checkpoint['epochs_trained']
         sets_trained = checkpoint['sets_trained']
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -334,7 +381,7 @@ def main():
                             'sets_trained': 0 if ilast == nfiles else ilast,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                            }, f"save/checkpoint-type{args.type}")
+                            }, f"save/checkpoint-type{args.type}-nout{args.nout}")
 
     if args.save_model:
         model.cpu()
@@ -344,9 +391,9 @@ def main():
         else:
             example = torch.randn(1, 11*11+2)
         traced_script_module = torch.jit.trace(model, example)
-        traced_script_module.save(f"save/net_model-type{args.type}.pt")
-        torch.save(model.state_dict(), f"save/net_weights-type{args.type}.pt")
-        print(f"\nModel saved to save/net_model-type{args.type}.pt\n")
+        traced_script_module.save(f"save/net_model-type{args.type}-nout{args.nout}.pt")
+        torch.save(model.state_dict(), f"save/net_weights-type{args.type}-nout{args.nout}.pt")
+        print(f"\nModel saved to save/net_model-type{args.type}-nout{args.nout}.pt\n")
 
 
 if __name__ == '__main__':
