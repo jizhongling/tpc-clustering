@@ -332,6 +332,7 @@ def main():
             file.is_file()):
             files.append(file.path + ":T")
     nfiles = min(args.nfiles, len(files))
+    data_size = min(args.data_size, len(files))
 
     if args.type == 0:
         h_diff = np.zeros(9, dtype=np.int64)
@@ -361,17 +362,18 @@ def main():
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(epochs_trained, args.epochs):
-        for iset in range(sets_trained, nfiles, args.data_size):
-            ilast = min(iset + args.data_size, nfiles)
-            savenow = ilast == nfiles or (ilast - sets_trained) // args.data_size % args.save_interval == 0
+        for iset in range(sets_trained, nfiles, data_size):
+            ilast = min(iset + data_size, nfiles)
+            savenow = ilast == nfiles or (ilast - sets_trained) // data_size % args.save_interval == 0
             print(f"\nDataset: {iset + 1} to {ilast}\n")
-            dataset = Data(args, files[iset:ilast])
-            nevents = len(dataset)
-            ntrain = int(nevents*0.9)
-            ntest = nevents - ntrain
-            train_set, test_set = random_split(dataset, [ntrain, ntest])
-            train_loader = DataLoader(train_set, **train_kwargs)
-            test_loader = DataLoader(test_set, **test_kwargs)
+            if data_size < nfiles or epoch == epochs_trained:
+                dataset = Data(args, files[iset:ilast])
+                nevents = len(dataset)
+                ntrain = int(nevents*0.9)
+                ntest = nevents - ntrain
+                train_set, test_set = random_split(dataset, [ntrain, ntest])
+                train_loader = DataLoader(train_set, **train_kwargs)
+                test_loader = DataLoader(test_set, **test_kwargs)
             train(args, model, device, train_loader, optimizer, epoch)
             h_diff, h_comp = test(args, model, device, test_loader, h_diff, h_comp, savenow)
             scheduler.step()
