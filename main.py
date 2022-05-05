@@ -28,6 +28,8 @@ class Data(Dataset):
             branch += ["truth_zcov", "truth_adc"]
         elif args.type == 4:
             branch += ["truth_adc"]
+        elif args.type == 5:
+            branch += ["ntouch", "track_rphi", "track_z", "reco_rphi", "reco_z"]
         else:
             sys.exit("\nError: Wrong type number\n")
         tree = ur.concatenate(files, branch, library='np')
@@ -39,7 +41,7 @@ class Data(Dataset):
             self.target = ntruth[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
             self.comp = torch.from_numpy(tree["nreco"])[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
             self.has_comp = True
-        else:
+        elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
             ind = torch.where(gadc > 0)[0]
             batch_ind = torch.where(ind.bincount() == args.nout)[0]
@@ -60,6 +62,17 @@ class Data(Dataset):
                 self.target = torch.from_numpy(tree["truth_zcov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
             elif args.type == 4:
                 self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
+        elif args.type == 5:
+            ntouch = torch.from_numpy(tree["ntouch"])
+            rphi = torch.from_numpy(tree["track_rphi"]).type(torch.float32).unsqueeze(1)
+            z = torch.from_numpy(tree["track_z"]).type(torch.float32).unsqueeze(1)
+            rphiz = torch.stack((rphi, z), dim=1)
+            batch_ind = torch.where((ntouch >= 1) * (LA.matrix_norm(rphiz) < 1))[0]
+            self.target = rphiz[batch_ind]
+            rphi = torch.from_numpy(tree["reco_rphi"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
+            z = torch.from_numpy(tree["reco_z"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
+            self.comp = torch.stack((rphi, z), dim=1)
+            self.has_comp = True
 
         if args.use_conv:
             adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11).sub(75).clamp(min=0)
@@ -93,7 +106,7 @@ class Net(nn.Module):
 
         if self.type == 0:
             nout = args.nmax + 1
-        elif self.type == 1:
+        elif self.type == 1 or self.type == 5:
             nout = 2 * self.nout
         elif self.type <= 4:
             nout = self.nout
@@ -146,7 +159,7 @@ class Net(nn.Module):
 
         if self.type == 0:
             output = F.log_softmax(x, dim=1)
-        elif self.type == 1:
+        elif self.type == 1 or self.type == 5:
             output = x.view(-1, 2, self.nout)
         elif self.type <= 4:
             output = x.view(-1, self.nout)
@@ -266,7 +279,7 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, pos: 1, rphicov: 2, zcov: 3, adc: 4, default: 0)')
+                        help='training type (ntruth: 0, pos: 1, rphicov: 2, zcov: 3, adc: 4, track: 5, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
     parser.add_argument('--nmax', type=int, default=3, metavar='N',
@@ -339,6 +352,8 @@ def main():
         h = np.zeros((400, 400), dtype=np.int64)
         h = [h for _ in range(3)]
         hlist = [h for _ in range(args.nout)]
+        if args.type == 5:
+            args.nout = 1
 
     epochs_trained = 0
     sets_trained = 0
