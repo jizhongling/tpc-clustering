@@ -284,6 +284,8 @@ def main():
                         help='number of output clusters (default: 1)')
     parser.add_argument('--nmax', type=int, default=3, metavar='N',
                         help='max number of output clusters (default: 3)')
+    parser.add_argument('--dir', type=str, default='data', metavar='DIR',
+                        help='directory of data (default: data)')
     parser.add_argument('--nfiles', type=int, default=10000, metavar='N',
                         help='max number of files used for training (default: 10000)')
     parser.add_argument('--data-size', type=int, default=10, metavar='N',
@@ -336,7 +338,7 @@ def main():
         test_kwargs.update(cuda_kwargs)
 
     files = []
-    for file in os.scandir("data"):
+    for file in os.scandir(args.dir):
         if (file.name.startswith("training-") and
             file.name.endswith(".root") and
             file.is_file()):
