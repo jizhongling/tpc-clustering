@@ -17,7 +17,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 class Data(Dataset):
     def __init__(self, args, files):
-        branch = ["adc", "layer", "ztan"]
+        branch = ["adc", "layer", "ztan", "ntouch"]
         if args.type == 0:
             branch += ["ntruth", "nreco"]
         elif args.type == 1:
@@ -29,22 +29,23 @@ class Data(Dataset):
         elif args.type == 4:
             branch += ["truth_adc"]
         elif args.type == 5:
-            branch += ["ntouch", "track_rphi", "track_z", "reco_rphi", "reco_z"]
+            branch += ["track_rphi", "track_z", "reco_rphi", "reco_z"]
         else:
             sys.exit("\nError: Wrong type number\n")
         tree = ur.concatenate(files, branch, library='np')
 
         self.has_comp = False
+        ntouch = torch.from_numpy(tree["ntouch"])
         if args.type == 0:
-            ntruth = torch.from_numpy(tree["ntruth"])
-            batch_ind = torch.arange(len(ntruth))
-            self.target = ntruth[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
+            batch_ind = torch.where(ntouch >= 1)[0]
+            self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
             self.comp = torch.from_numpy(tree["nreco"])[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
             self.has_comp = True
         elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
-            ind = torch.where(gadc > 0)[0]
-            batch_ind = torch.where(ind.bincount() == args.nout)[0]
+            ntouch = ntouch.unsqueeze(1).expand(-1, gadc.size(dim=1))
+            ind = torch.where((gadc > 0) * (ntouch >= 1))[0]
+            batch_ind = torch.where(ind.bincount() >= args.nout)[0]
             batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
             si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
             if args.type == 1:
@@ -63,7 +64,6 @@ class Data(Dataset):
             elif args.type == 4:
                 self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
         elif args.type == 5:
-            ntouch = torch.from_numpy(tree["ntouch"])
             rphi = torch.from_numpy(tree["track_rphi"]).type(torch.float32).unsqueeze(1)
             z = torch.from_numpy(tree["track_z"]).type(torch.float32).unsqueeze(1)
             rphiz = torch.stack((rphi, z), dim=1)
@@ -75,12 +75,12 @@ class Data(Dataset):
             self.has_comp = True
 
         if args.use_conv:
-            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11).sub(75).clamp(min=0)
+            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11)
             layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
             ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
             self.input = torch.stack((adc, layer, ztan), dim=1)
         else:
-            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).sub(75).clamp(min=0)
+            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32)
             layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).unsqueeze(1)
             ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).unsqueeze(1)
             self.input = torch.cat((adc, layer, ztan), dim=1)
