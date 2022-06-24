@@ -21,15 +21,15 @@ class Data(Dataset):
         if args.type == 0:
             branch += ["ntruth", "nreco"]
         elif args.type == 1:
-            branch += ["truth_rphi", "truth_z", "truth_adc", "reco_rphi", "reco_z", "reco_adc"]
+            branch += ["truth_phi", "truth_z", "truth_adc", "reco_phi", "reco_z", "reco_adc"]
         elif args.type == 2:
-            branch += ["truth_rphicov", "truth_adc"]
+            branch += ["truth_phicov", "truth_adc"]
         elif args.type == 3:
             branch += ["truth_zcov", "truth_adc"]
         elif args.type == 4:
             branch += ["truth_adc"]
         elif args.type == 5:
-            branch += ["track_rphi", "track_z", "reco_rphi", "reco_z"]
+            branch += ["track_phi", "track_z", "reco_phi", "reco_z"]
         else:
             sys.exit("\nError: Wrong type number\n")
         tree = ur.concatenate(files, branch, library='np')
@@ -49,29 +49,29 @@ class Data(Dataset):
             batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
             si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
             if args.type == 1:
-                rphi = torch.from_numpy(tree["truth_rphi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
                 z = torch.from_numpy(tree["truth_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-                self.target = torch.stack((rphi, z), dim=1)
+                self.target = torch.stack((phi, z), dim=1)
                 si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
-                rphi = torch.from_numpy(tree["reco_rphi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
                 z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-                self.comp = torch.stack((rphi, z), dim=1)
+                self.comp = torch.stack((phi, z), dim=1)
                 self.has_comp = True
             elif args.type == 2:
-                self.target = torch.from_numpy(tree["truth_rphicov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                self.target = torch.from_numpy(tree["truth_phicov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
             elif args.type == 3:
                 self.target = torch.from_numpy(tree["truth_zcov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
             elif args.type == 4:
                 self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
         elif args.type == 5:
-            rphi = torch.from_numpy(tree["track_rphi"]).type(torch.float32).unsqueeze(1)
+            phi = torch.from_numpy(tree["track_phi"]).type(torch.float32).unsqueeze(1)
             z = torch.from_numpy(tree["track_z"]).type(torch.float32).unsqueeze(1)
-            rphiz = torch.stack((rphi, z), dim=1)
-            batch_ind = torch.where((ntouch >= 1) * (LA.matrix_norm(rphiz) < 1))[0]
-            self.target = rphiz[batch_ind]
-            rphi = torch.from_numpy(tree["reco_rphi"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
+            phiz = torch.stack((phi, z), dim=1)
+            batch_ind = torch.where((ntouch >= 1) * (LA.matrix_norm(phiz) < 1))[0]
+            self.target = phiz[batch_ind]
+            phi = torch.from_numpy(tree["reco_phi"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
             z = torch.from_numpy(tree["reco_z"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
-            self.comp = torch.stack((rphi, z), dim=1)
+            self.comp = torch.stack((phi, z), dim=1)
             self.has_comp = True
 
         if args.use_conv:
@@ -236,7 +236,7 @@ def test(args, model, device, test_loader, hlist, savenow):
                         for i in range(nitem):
                             hvalue = vlist[i].detach().cpu().numpy()
                             hist, xedges, yedges = np.histogram2d(hvalue[:, 0, iout], hvalue[:, 1, iout],
-                                                                  bins=400, range=[[-2, 2], [-2, 2]])
+                                                                  bins=200, range=[[-1, 1], [-1, 1]])
                             hlist[iout][i] = np.add(hlist[iout][i], hist)
 
     # mean batch loss for each element
@@ -261,12 +261,14 @@ def test(args, model, device, test_loader, hlist, savenow):
                 axs = np.expand_dims(axs, axis=0)
             for iout in range(args.nout):
                 for i in range(nitem):
-                    im = axs[iout, i].imshow(hlist[iout][i], interpolation='nearest', origin='lower',
+                    # numpy.histogram2d does not follow Cartesian convention (see Notes)
+                    # therefore transpose for visualization purposes
+                    im = axs[iout, i].imshow(hlist[iout][i].T, interpolation='nearest', origin='lower',
                                              extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                                              norm=colors.LogNorm())
                     fig.colorbar(im, ax=axs[iout, i], fraction=0.047)
-                    axs[iout, i].set(xlabel=r"$r\phi$ (cm)")
-                    axs[iout, i].set(ylabel=r"$z$ (cm)")
+                    axs[iout, i].set(xlabel=r"$\phi$")
+                    axs[iout, i].set(ylabel=r"$z$")
                     axs[iout, i].set(title=f"{hlabel[i]}: No. {iout + 1} highest energy")
             fig.tight_layout()
         plt.savefig(f"save/diff-type{args.type}-nout{args.nout}.png")
@@ -279,7 +281,7 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, pos: 1, rphicov: 2, zcov: 3, adc: 4, track: 5, default: 0)')
+                        help='training type (ntruth: 0, pos: 1, phicov: 2, zcov: 3, adc: 4, track: 5, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
     parser.add_argument('--nmax', type=int, default=3, metavar='N',
@@ -351,7 +353,7 @@ def main():
         hlist = [h for _ in range(3)]
         args.nout = args.nmax
     else:
-        h = np.zeros((400, 400), dtype=np.int64)
+        h = np.zeros((200, 200), dtype=np.int64)
         h = [h for _ in range(3)]
         hlist = [h for _ in range(args.nout)]
         if args.type == 5:
