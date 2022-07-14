@@ -97,12 +97,33 @@ class Data(Dataset):
             return input, target
 
 
+class DataMLP(Dataset):
+    def __init__(self, args, files):
+        tree = ur.concatenate(files, library='np')
+
+        self.target = torch.from_numpy(tree["ntruth"]).type(torch.int64).sub(1).clamp(max=args.nmax)
+
+        adc = []
+        for i in range(3*3):
+            adc.append(torch.from_numpy(tree[f"e{i+1}"]).type(torch.float32))
+        self.input = torch.stack(adc, dim=1)
+
+    def __len__(self):
+        return len(self.target)
+
+    def __getitem__(self, idx):
+        input = self.input[idx]
+        target = self.target[idx]
+        return input, target
+
+
 class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
         self.type = args.type
         self.nout = args.nout
         self.use_conv = args.use_conv
+        self.use_mlp = args.use_mlp
 
         if self.type == 0:
             nout = args.nmax + 1
@@ -113,7 +134,11 @@ class Net(nn.Module):
         else:
             sys.exit("\nError: Wrong type number\n")
 
-        if self.use_conv:
+        if self.use_mlp:
+            print("\nUsing MLP network\n")
+            self.fc1 = nn.Linear(3*3, 3*3+6)
+            self.fc2 = nn.Linear(3*3+6, nout)
+        elif self.use_conv:
             print("\nUsing convolutional neural network\n")
             self.conv1 = nn.Conv2d(3, 32, 3, 1)
             self.conv2 = nn.Conv2d(32, 64, 3, 1)
@@ -133,7 +158,11 @@ class Net(nn.Module):
             self.norm2 = nn.BatchNorm1d(10)
 
     def forward(self, x):
-        if self.use_conv:
+        if self.use_mlp:
+            x = self.fc1(x)
+            x = torch.sigmoid(x)
+            x = self.fc2(x)
+        elif self.use_conv:
             x = self.conv1(x)
             x = self.norm1(x)
             x = F.relu(x)
@@ -197,7 +226,6 @@ def test(args, model, device, test_loader, hlist, savenow):
                 data, target, comp = item[0].to(device), item[1].to(device), item[2].to(device)
             else:
                 data, target = item[0].to(device), item[1].to(device)
-                args.print = False
             output = model(data)
             if args.type == 0:
                 # sum up batch loss for all elements
@@ -304,6 +332,8 @@ def main():
                         help='learning rate step gamma (default: 0.5)')
     parser.add_argument('--use-conv', action='store_true', default=False,
                         help='use convolutional neural network')
+    parser.add_argument('--use-mlp', action='store_true', default=False,
+                        help='use MLP network')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disable CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -381,7 +411,10 @@ def main():
             savenow = ilast == nfiles or (ilast - sets_trained) // data_size % args.save_interval == 0
             print(f"\nDataset: {iset + 1} to {ilast}\n")
             if data_size < nfiles or epoch == epochs_trained:
-                dataset = Data(args, files[iset:ilast])
+                if args.use_mlp:
+                    dataset = DataMLP(args, files[iset:ilast])
+                else:
+                    dataset = Data(args, files[iset:ilast])
                 nevents = len(dataset)
                 ntrain = int(nevents*0.9)
                 ntest = nevents - ntrain
