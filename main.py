@@ -2,6 +2,7 @@ from __future__ import print_function
 import argparse
 import sys
 import os
+import math
 import numpy as np
 import uproot as ur
 import matplotlib.pyplot as plt
@@ -17,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 class Data(Dataset):
     def __init__(self, args, files):
-        branch = ["adc", "layer", "ztan", "ntouch"]
+        branch = ["adc", "layer", "cosphi", "sinphi", "ztan", "ntouch"]
         if args.type == 0:
             branch += ["ntruth", "nreco"]
         elif args.type == 1:
@@ -38,9 +39,7 @@ class Data(Dataset):
         ntouch = torch.from_numpy(tree["ntouch"])
         if args.type == 0:
             batch_ind = torch.where(ntouch >= 1)[0]
-            self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
-            self.comp = torch.from_numpy(tree["nreco"])[batch_ind, 0:].type(torch.int64).sum(dim=1).clamp(max=args.nmax)
-            self.has_comp = True
+            self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].sum(dim=1).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
         elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
             ntouch = ntouch.unsqueeze(1).expand(-1, gadc.size(dim=1))
@@ -77,13 +76,17 @@ class Data(Dataset):
         if args.use_conv:
             adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11)
             layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
+            cosphi = torch.from_numpy(tree["cosphi"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
+            sinphi = torch.from_numpy(tree["sinphi"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
             ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
-            self.input = torch.stack((adc, layer, ztan), dim=1)
+            self.input = torch.stack((adc, layer, cosphi, sinphi, ztan), dim=1)
         else:
             adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32)
             layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).unsqueeze(1)
+            cosphi = torch.from_numpy(tree["cosphi"])[batch_ind].type(torch.float32).unsqueeze(1)
+            sinphi = torch.from_numpy(tree["sinphi"])[batch_ind].type(torch.float32).unsqueeze(1)
             ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).unsqueeze(1)
-            self.input = torch.cat((adc, layer, ztan), dim=1)
+            self.input = torch.cat((adc, layer, cosphi, sinphi, ztan), dim=1)
 
     def __len__(self):
         return len(self.target)
@@ -101,12 +104,20 @@ class DataMLP(Dataset):
     def __init__(self, args, files):
         tree = ur.concatenate(files, library='np')
 
-        self.target = torch.from_numpy(tree["ntruth"]).type(torch.int64).sub(1).clamp(max=args.nmax)
+        self.target = torch.from_numpy(tree["ntruth"]).neg().add(2).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
 
-        adc = []
-        for i in range(3*3):
-            adc.append(torch.from_numpy(tree[f"e{i+1}"]).type(torch.float32))
-        self.input = torch.stack(adc, dim=1)
+        adc = torch.from_numpy(tree["e1"]).type(torch.float32).unsqueeze(1)
+        for i in range(1, 3*3):
+            adc = torch.cat((adc, torch.from_numpy(tree[f"e{i+1}"]).type(torch.float32).unsqueeze(1)), dim=1)
+        center_x = torch.from_numpy(tree["center_x"]).type(torch.float32).unsqueeze(1)
+        center_y = torch.from_numpy(tree["center_y"]).type(torch.float32).unsqueeze(1)
+        if args.use_conv:
+            adc = adc.view(-1, 3, 3)
+            center_x = center_x.view(-1, 1, 1).expand(-1, 3, 3)
+            center_y = center_y.view(-1, 1, 1).expand(-1, 3, 3)
+            self.input = torch.stack((adc, center_x, center_y), dim=1)
+        else:
+            self.input = torch.cat((adc, center_x, center_y), dim=1)
 
     def __len__(self):
         return len(self.target)
@@ -123,10 +134,9 @@ class Net(nn.Module):
         self.type = args.type
         self.nout = args.nout
         self.use_conv = args.use_conv
-        self.use_mlp = args.use_mlp
 
         if self.type == 0:
-            nout = args.nmax + 1
+            nout = 1
         elif self.type == 1 or self.type == 5:
             nout = 2 * self.nout
         elif self.type <= 4:
@@ -134,35 +144,32 @@ class Net(nn.Module):
         else:
             sys.exit("\nError: Wrong type number\n")
 
-        if self.use_mlp:
-            print("\nUsing MLP network\n")
-            self.fc1 = nn.Linear(3*3, 3*3+6)
-            self.fc2 = nn.Linear(3*3+6, nout)
-        elif self.use_conv:
+        nrow = 3 if args.use_mlp else 11
+        nch = 2 if args.use_mlp else 4
+
+        if self.use_conv:
             print("\nUsing convolutional neural network\n")
-            self.conv1 = nn.Conv2d(3, 32, 3, 1)
-            self.conv2 = nn.Conv2d(32, 64, 3, 1)
-            self.dropout1 = nn.Dropout(0.25)
-            self.dropout2 = nn.Dropout(0.5)
-            self.fc1 = nn.Linear(64*16, 128)
+            self.conv1 = nn.Conv2d(1+nch, 32, 3, 1, padding='same')
+            self.conv2 = nn.Conv2d(32, 64, 3, 1, padding='same')
+            self.fc1 = nn.Linear(64*math.ceil(nrow/2)**2, 128)
             self.fc2 = nn.Linear(128, nout)
+            self.norm0 = nn.BatchNorm2d(1+nch)
             self.norm1 = nn.BatchNorm2d(32)
             self.norm2 = nn.BatchNorm2d(64)
             self.norm3 = nn.BatchNorm1d(128)
+            self.dropout1 = nn.Dropout(0.25)
+            self.dropout2 = nn.Dropout(0.5)
         else:
             print("\nUsing linear neural network\n")
-            self.fc1 = nn.Linear(11*11+2, 10)
-            self.fc2 = nn.Linear(10, 10)
-            self.fc3 = nn.Linear(10, nout)
-            self.norm1 = nn.BatchNorm1d(10)
-            self.norm2 = nn.BatchNorm1d(10)
+            nin = nrow**2+nch
+            self.fc1 = nn.Linear(nin, nin+5)
+            self.fc2 = nn.Linear(nin+5, nout)
+            self.norm0 = nn.BatchNorm1d(nin)
+            self.norm1 = nn.BatchNorm1d(nin+5)
 
     def forward(self, x):
-        if self.use_mlp:
-            x = self.fc1(x)
-            x = torch.sigmoid(x)
-            x = self.fc2(x)
-        elif self.use_conv:
+        if self.use_conv:
+            x = self.norm0(x)
             x = self.conv1(x)
             x = self.norm1(x)
             x = F.relu(x)
@@ -178,16 +185,14 @@ class Net(nn.Module):
             x = self.dropout2(x)
             x = self.fc2(x)
         else:
+            x = self.norm0(x)
             x = self.fc1(x)
             x = self.norm1(x)
-            x = torch.sigmoid(x)
+            x = torch.tanh(x)
             x = self.fc2(x)
-            x = self.norm2(x)
-            x = torch.sigmoid(x)
-            x = self.fc3(x)
 
         if self.type == 0:
-            output = F.log_softmax(x, dim=1)
+            output = torch.sigmoid(x)
         elif self.type == 1 or self.type == 5:
             output = x.view(-1, 2, self.nout)
         elif self.type <= 4:
@@ -201,12 +206,8 @@ def train(args, model, device, train_loader, optimizer, epoch):
         data, target = item[0].to(device), item[1].to(device)
         optimizer.zero_grad()
         output = model(data)
-        if args.type == 0:
-            # mean batch loss for each element
-            loss = F.nll_loss(output, target)
-        else:
-            # mean batch loss for each element
-            loss = F.mse_loss(output, target)
+        # mean batch loss for each element
+        loss = F.mse_loss(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -227,26 +228,20 @@ def test(args, model, device, test_loader, hlist, savenow):
             else:
                 data, target = item[0].to(device), item[1].to(device)
             output = model(data)
+            # sum up batch loss for all elements
+            test_loss += F.mse_loss(output, target, reduction='sum').item()
             if args.type == 0:
-                # sum up batch loss for all elements
-                test_loss += F.nll_loss(output, target, reduction='sum').item()
-                # get the index of the max log-probability
-                pred = output.argmax(dim=1)
-                refs = target.view_as(pred)
+                # sig = 1 and bg = 0
+                pred = torch.where(output > 0.5, 1, 0)
+                refs = target.type(torch.int64).view_as(pred)
                 correct += pred.eq(refs).sum().item()
                 if args.print:
-                    try: comp
-                    except NameError:
-                        vlist = torch.stack((pred, refs), dim=0)
-                    else:
-                        vlist = torch.stack((pred, refs, comp), dim=0)
-                    for i in range(nitem):
-                        hvalue = vlist[i].detach().cpu().numpy()
-                        hist, bin_edges = np.histogram(hvalue, bins=7, range=(-1.5, 5.5))
-                        hlist[i] = np.add(hlist[i], hist)
+                    vlist = torch.stack((target, output), dim=0)
+                    hvalue = vlist.detach().cpu().numpy()
+                    hist, xedges, yedges = np.histogram2d(hvalue[0, :, 0], hvalue[1, :, 0],
+                                                          bins=[2, 100], range=[[-0.5, 1.5], [0, 1]])
+                    hlist[0][0] = np.add(hlist[0][0], hist)
             else:
-                # sum up batch loss for all elements
-                test_loss += F.mse_loss(output, target, reduction='sum').item()
                 # count the number of improved predictions
                 try: comp
                 except NameError: pass
@@ -257,9 +252,9 @@ def test(args, model, device, test_loader, hlist, savenow):
                 if args.print:
                     try: comp
                     except NameError:
-                        vlist = torch.stack((output, target), dim=0)
+                        vlist = torch.stack((target, diff), dim=0)
                     else:
-                        vlist = torch.stack((output, target, comp), dim=0)
+                        vlist = torch.stack((target, diff, diff_comp), dim=0)
                     for iout in range(args.nout):
                         for i in range(nitem):
                             hvalue = vlist[i].detach().cpu().numpy()
@@ -275,15 +270,24 @@ def test(args, model, device, test_loader, hlist, savenow):
         100. * correct / len(test_loader.dataset)))
 
     if args.print and savenow:
-        hlabel = ['NN', 'truth', 'reco']
         plt.clf()
         if args.type == 0:
-            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-            for i in range(nitem):
-                plt.plot(bin_centers, hlist[i], drawstyle='steps-mid', label=hlabel[i])
+            nsum = []
+            ncum = []
+            for i in range(2):
+                nsum.append(np.sum(hlist[0][0][i, :]))
+                ncum.append(nsum[i] - np.cumsum(hlist[0][0][i, :]))
+            hlabel = ['Sig', 'Bg', r'$S/\sqrt{S+B}$']
+            bin_centers = (yedges[:-1] + yedges[1:]) / 2
+            yvalue = [ncum[1] / nsum[1], ncum[0] / nsum[0],
+                      ncum[1] / np.sqrt(ncum[1] + ncum[0] + 1e-6) / np.sqrt(nsum[1] + 1e-6)]
+            for i in range(3):
+                plt.plot(bin_centers, yvalue[i], drawstyle='steps-mid', label=hlabel[i])
             plt.legend()
-            plt.xlabel(r"Number of clusters")
+            plt.xlabel(r"Cut value")
+            plt.ylabel(r"Efficiency")
         else:
+            hlabel = ['Truth', 'NN-Truth', 'Reco-Truth']
             fig, axs = plt.subplots(args.nout, 3, figsize=(12, 12))
             if args.nout == 1:
                 axs = np.expand_dims(axs, axis=0)
@@ -295,8 +299,8 @@ def test(args, model, device, test_loader, hlist, savenow):
                                              extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                                              norm=colors.LogNorm())
                     fig.colorbar(im, ax=axs[iout, i], fraction=0.047)
-                    axs[iout, i].set(xlabel=r"$\phi$")
-                    axs[iout, i].set(ylabel=r"$z$")
+                    axs[iout, i].set(xlabel=r"$\phi$" if i == 0 else r"$\Delta\phi$")
+                    axs[iout, i].set(ylabel=r"$z$" if i == 0 else r"$\Delta z$")
                     axs[iout, i].set(title=f"{hlabel[i]}: No. {iout + 1} highest energy")
             fig.tight_layout()
         plt.savefig(f"save/diff-type{args.type}-nout{args.nout}.png")
@@ -312,24 +316,22 @@ def main():
                         help='training type (ntruth: 0, pos: 1, phicov: 2, zcov: 3, adc: 4, track: 5, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
-    parser.add_argument('--nmax', type=int, default=3, metavar='N',
-                        help='max number of output clusters (default: 3)')
     parser.add_argument('--dir', type=str, default='data', metavar='DIR',
                         help='directory of data (default: data)')
     parser.add_argument('--nfiles', type=int, default=10000, metavar='N',
                         help='max number of files used for training (default: 10000)')
-    parser.add_argument('--data-size', type=int, default=10, metavar='N',
-                        help='number of files for each training (default: 10)')
-    parser.add_argument('--batch-size', type=int, default=256, metavar='N',
-                        help='input batch size for training (default: 256)')
+    parser.add_argument('--data-size', type=int, default=100, metavar='N',
+                        help='number of files for each training (default: 100)')
+    parser.add_argument('--batch-size', type=int, default=1024, metavar='N',
+                        help='input batch size for training (default: 1024)')
     parser.add_argument('--test-batch-size', type=int, default=1024, metavar='N',
                         help='input batch size for testing (default: 1024)')
-    parser.add_argument('--epochs', type=int, default=1, metavar='N',
-                        help='number of epochs to train (default: 1)')
+    parser.add_argument('--epochs', type=int, default=500, metavar='N',
+                        help='number of epochs to train (default: 500)')
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
-    parser.add_argument('--gamma', type=float, default=0.5, metavar='M',
-                        help='learning rate step gamma (default: 0.5)')
+    parser.add_argument('--gamma', type=float, default=0.95, metavar='M',
+                        help='learning rate step gamma (default: 0.95)')
     parser.add_argument('--use-conv', action='store_true', default=False,
                         help='use convolutional neural network')
     parser.add_argument('--use-mlp', action='store_true', default=False,
@@ -338,10 +340,10 @@ def main():
                         help='disable CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=400, metavar='N',
-                        help='how many batches to wait before logging training status (default: 400)')
-    parser.add_argument('--save-interval', type=int, default=5, metavar='N',
-                        help='how many groups of dataset to wait before saving the checkpoint (default: 5)')
+    parser.add_argument('--log-interval', type=int, default=100, metavar='N',
+                        help='how many batches to wait before logging training status (default: 100)')
+    parser.add_argument('--save-interval', type=int, default=20, metavar='N',
+                        help='how many groups of dataset to wait before saving the checkpoint (default: 20)')
     parser.add_argument('--print', action='store_true', default=False,
                         help='print output')
     parser.add_argument('--save-model', action='store_true', default=False,
@@ -379,13 +381,13 @@ def main():
     data_size = min(args.data_size, len(files))
 
     if args.type == 0:
-        h = np.zeros(7, dtype=np.int64)
-        hlist = [h for _ in range(3)]
-        args.nout = args.nmax
+        h = np.zeros((2, 100), dtype=np.float32)
+        hl = [h]
+        hlist = [hl]
     else:
         h = np.zeros((200, 200), dtype=np.int64)
-        h = [h for _ in range(3)]
-        hlist = [h for _ in range(args.nout)]
+        hl = [h for _ in range(3)]
+        hlist = [hl for _ in range(args.nout)]
         if args.type == 5:
             args.nout = 1
 
@@ -406,15 +408,18 @@ def main():
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(epochs_trained, args.epochs):
+        if args.print:
+            for hl in hlist:
+                for h in hl:
+                    h.fill(0)
         for iset in range(sets_trained, nfiles, data_size):
             ilast = min(iset + data_size, nfiles)
-            savenow = ilast == nfiles or (ilast - sets_trained) // data_size % args.save_interval == 0
+            savenow = ( (ilast - sets_trained) // data_size % args.save_interval == 0 or
+                        (epoch + 1 - epochs_trained) % args.save_interval == 0 or
+                        (epoch + 1) == args.epochs )
             print(f"\nDataset: {iset + 1} to {ilast}\n")
             if data_size < nfiles or epoch == epochs_trained:
-                if args.use_mlp:
-                    dataset = DataMLP(args, files[iset:ilast])
-                else:
-                    dataset = Data(args, files[iset:ilast])
+                dataset = DataMLP(args, files[iset:ilast]) if args.use_mlp else Data(args, files[iset:ilast])
                 nevents = len(dataset)
                 ntrain = int(nevents*0.9)
                 ntest = nevents - ntrain
@@ -435,10 +440,12 @@ def main():
     if args.save_model:
         model.cpu()
         model.eval()
+        nrow = 3 if args.use_mlp else 11
+        nch = 2 if args.use_mlp else 4
         if args.use_conv:
-            example = torch.randn(1, 3, 11, 11)
+            example = torch.randn(1, 1+nch, nrow, nrow)
         else:
-            example = torch.randn(1, 11*11+2)
+            example = torch.randn(1, nrow**2+nch)
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save(f"save/net_model-type{args.type}-nout{args.nout}.pt")
         torch.save(model.state_dict(), f"save/net_weights-type{args.type}-nout{args.nout}.pt")
