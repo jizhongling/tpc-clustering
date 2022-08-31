@@ -5,6 +5,7 @@ import os
 import math
 import numpy as np
 import uproot as ur
+from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from matplotlib import colors
 import torch
@@ -197,6 +198,11 @@ class Net(nn.Module):
         return output
 
 
+def gauss(x, *p):
+    A, mu, sigma = p
+    return A * np.exp(-(x - mu) ** 2 / (2 * sigma ** 2))
+
+
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
     for batch_idx, item in enumerate(train_loader):
@@ -243,23 +249,23 @@ def test(args, model, device, test_loader, savenow):
                     else:
                         hlist.append(hist)
             else:
+                diff = output.sub(target)
                 # count the number of improved predictions
                 try: comp
                 except NameError: pass
                 else:
-                    diff = output.sub(target)
                     diff_comp = comp.sub(target)
                     correct += (LA.matrix_norm(diff) < LA.matrix_norm(diff_comp)).sum().item()
                 if args.print and savenow:
                     try: comp
                     except NameError:
-                        vlist = torch.stack((target, diff), dim=0)
+                        vlist = diff.unsqueeze(0)
                     else:
-                        vlist = torch.stack((target, diff, diff_comp), dim=0)
+                        vlist = torch.stack((diff, diff_comp), dim=0)
                     hll = []
                     for iout in range(args.nout):
                         hl = []
-                        for i in range(nitem):
+                        for i in range(nitem-1):
                             hvalue = vlist[i].detach().cpu().numpy()
                             hist, xedges, yedges = np.histogram2d(hvalue[:, 0, iout], hvalue[:, 1, iout],
                                                                   bins=200, range=[[-1, 1], [-1, 1]])
@@ -280,37 +286,45 @@ def test(args, model, device, test_loader, savenow):
     if args.print and savenow:
         plt.clf()
         if args.type == 0:
-            nsum = []
-            ncum = []
-            for i in range(2):
-                nsum.append(np.sum(hlist[0][i, :]))
-                ncum.append(nsum[i] - np.cumsum(hlist[0][i, :]))
+            ncum = np.cumsum(hlist[0], axis=1)
+            ncum = np.expand_dims(ncum[:, -1], axis=1) - ncum
             hlabel = ['Sig', 'Bg', r'$S/\sqrt{S+B}$']
             bin_centers = (yedges[:-1] + yedges[1:]) / 2
-            yvalue = [ncum[1] / nsum[1], ncum[0] / nsum[0],
-                      ncum[1] / np.sqrt(ncum[1] + ncum[0] + 1e-6) / np.sqrt(nsum[1] + 1e-6)]
+            yvalue = [ncum[1] / ncum[1, 0], ncum[0] / ncum[0, 0],
+                      ncum[1] / np.sqrt(ncum[1] + ncum[0] + 1e-6) / np.sqrt(ncum[1, 0] + 1e-6)]
             for i in range(3):
                 plt.plot(bin_centers, yvalue[i], drawstyle='steps-mid', label=hlabel[i])
-            plt.legend()
             plt.xlabel(r"Cut value")
             plt.ylabel(r"Efficiency")
         else:
-            hlabel = ['Truth', 'NN-Truth', 'Reco-Truth']
-            fig, axs = plt.subplots(args.nout, 3, figsize=(12, 12))
-            if args.nout == 1:
-                axs = np.expand_dims(axs, axis=0)
+            hlabel = ['NN', 'Reco']
+            alabel = [r"$\Delta\phi$", r"$\Delta z$"]
+            fig, axs = plt.subplots(2*args.nout, nitem-1, figsize=(12*(nitem-1), 24*args.nout))
+            if nitem-1 == 1:
+                axs = np.expand_dims(axs, axis=1)
             for iout in range(args.nout):
-                for i in range(nitem):
+                for i in range(nitem-1):
                     # numpy.histogram2d does not follow Cartesian convention (see Notes)
                     # therefore transpose for visualization purposes
-                    im = axs[iout, i].imshow(hlist[iout][i].T, interpolation='nearest', origin='lower',
+                    im = axs[2*iout, i].imshow(hlist[iout][i].T, interpolation='nearest', origin='lower',
                                              extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                                              norm=colors.LogNorm())
                     fig.colorbar(im, ax=axs[iout, i], fraction=0.047)
-                    axs[iout, i].set(xlabel=r"$\phi$" if i == 0 else r"$\Delta\phi$")
-                    axs[iout, i].set(ylabel=r"$z$" if i == 0 else r"$\Delta z$")
-                    axs[iout, i].set(title=f"{hlabel[i]}: No. {iout + 1} highest energy")
+                    axs[2*iout, i].set(xlabel=alabel[0])
+                    axs[2*iout, i].set(ylabel=alabel[1])
+                    axs[2*iout, i].set(title=f"{hlabel[i]}: No. {iout + 1} highest energy")
+                    for j in range(2):
+                        bin_centers = (xedges[:-1] + xedges[1:]) / 2
+                        hproj = np.sum(hlist[iout][i], axis=1-j)
+                        coeff, covar = curve_fit(gauss, bin_centers, hproj, p0=[hproj[100], 0, 0.5])
+                        hfit = gauss(bin_centers, *coeff)
+                        axs[2*iout+1, j].plot(bin_centers, hproj, drawstyle='steps-mid', label=hlabel[i])
+                        axs[2*iout+1, j].plot(bin_centers, hfit)
+                        axs[2*iout+1, j].set(xlabel=alabel[j])
+                        axs[2*iout+1, j].text(0.05, 0.95-0.05*i, r"{}: $\sigma$ = {:.4f}".format(hlabel[i], coeff[2]),
+                                              fontsize='xx-large', transform=axs[2*iout+1, j].transAxes)
             fig.tight_layout()
+        plt.legend(fontsize='xx-large')
         plt.savefig(f"save/diff-type{args.type}-nout{args.nout}.png")
         print(f"\nFigure saved to save/diff-type{args.type}-nout{args.nout}.png\n")
 
