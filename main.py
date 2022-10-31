@@ -23,7 +23,7 @@ class Data(Dataset):
         if args.type == 0:
             branch += ["ntruth", "nreco"]
         elif args.type == 1:
-            branch += ["truth_phi", "truth_z", "truth_adc", "reco_phi", "reco_z", "reco_adc"]
+            branch += ["truth_phi", "truth_z", "truth_adc", "reco_phi", "reco_z", "reco_adc", "reco_ephi"]
         elif args.type == 2:
             branch += ["truth_phicov", "truth_adc"]
         elif args.type == 3:
@@ -31,7 +31,7 @@ class Data(Dataset):
         elif args.type == 4:
             branch += ["truth_adc"]
         elif args.type == 5:
-            branch += ["track_phi", "track_z", "reco_phi", "reco_z"]
+            branch += ["truhit_phi", "truhit_z", "reco_phi", "reco_z"]
         else:
             sys.exit("\nError: Wrong type number\n")
         tree = ur.concatenate(files, branch, library='np')
@@ -43,8 +43,9 @@ class Data(Dataset):
             self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].sum(dim=1).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
         elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
+            ephi = torch.from_numpy(tree["reco_ephi"])[:, 0].unsqueeze(1).expand(-1, gadc.size(dim=1))
             ntouch = ntouch.unsqueeze(1).expand(-1, gadc.size(dim=1))
-            ind = torch.where((gadc > 0) * (ntouch >= 0))[0]
+            ind = torch.where((gadc > 0) * (ephi < 0.01) * (ntouch >= 0))[0]
             batch_ind = torch.where(ind.bincount() >= args.nout)[0]
             batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
             si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
@@ -64,8 +65,8 @@ class Data(Dataset):
             elif args.type == 4:
                 self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
         elif args.type == 5:
-            phi = torch.from_numpy(tree["track_phi"]).type(torch.float32).unsqueeze(1)
-            z = torch.from_numpy(tree["track_z"]).type(torch.float32).unsqueeze(1)
+            phi = torch.from_numpy(tree["truhit_phi"]).type(torch.float32).unsqueeze(1)
+            z = torch.from_numpy(tree["truhit_z"]).type(torch.float32).unsqueeze(1)
             phiz = torch.stack((phi, z), dim=1)
             batch_ind = torch.where((ntouch >= 0) * (LA.matrix_norm(phiz) < 1))[0]
             self.target = phiz[batch_ind]
@@ -298,6 +299,7 @@ def test(args, model, device, test_loader, savenow):
             plt.ylabel(r"Efficiency")
         else:
             hlabel = ['NN', 'Reco']
+            cname = ['green', 'red']
             alabel = [r"$\Delta\phi$", r"$\Delta z$"]
             fig, axs = plt.subplots(2*args.nout, nitem-1, figsize=(12*(nitem-1), 24*args.nout))
             if nitem-1 == 1:
@@ -307,8 +309,8 @@ def test(args, model, device, test_loader, savenow):
                     # numpy.histogram2d does not follow Cartesian convention (see Notes)
                     # therefore transpose for visualization purposes
                     im = axs[2*iout, i].imshow(hlist[iout][i].T, interpolation='nearest', origin='lower',
-                                             extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-                                             norm=colors.LogNorm())
+                                               extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                                               norm=colors.LogNorm())
                     fig.colorbar(im, ax=axs[iout, i], fraction=0.047)
                     axs[2*iout, i].set(xlabel=alabel[0])
                     axs[2*iout, i].set(ylabel=alabel[1])
@@ -318,8 +320,8 @@ def test(args, model, device, test_loader, savenow):
                         hproj = np.sum(hlist[iout][i], axis=1-j)
                         coeff, covar = curve_fit(gauss, bin_centers, hproj, p0=[hproj[100], 0, 0.5])
                         hfit = gauss(bin_centers, *coeff)
-                        axs[2*iout+1, j].plot(bin_centers, hproj, drawstyle='steps-mid', label=hlabel[i])
-                        axs[2*iout+1, j].plot(bin_centers, hfit)
+                        axs[2*iout+1, j].plot(bin_centers, hproj, drawstyle='steps-mid', color=cname[i], label=hlabel[i])
+                        axs[2*iout+1, j].plot(bin_centers, hfit, color='black')
                         axs[2*iout+1, j].set(xlabel=alabel[j])
                         axs[2*iout+1, j].text(0.05, 0.95-0.05*i, r"{}: $\sigma$ = {:.4f}".format(hlabel[i], coeff[2]),
                                               fontsize='xx-large', transform=axs[2*iout+1, j].transAxes)
@@ -333,7 +335,7 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, pos: 1, phicov: 2, zcov: 3, adc: 4, track: 5, default: 0)')
+                        help='training type (ntruth: 0, pos: 1, phicov: 2, zcov: 3, adc: 4, truhit: 5, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
     parser.add_argument('--dir', type=str, default='data', metavar='DIR',
