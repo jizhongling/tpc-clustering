@@ -22,14 +22,12 @@ class Data(Dataset):
         branch = ["adc", "layer", "ztan", "ntouch"]
         if args.type == 0:
             branch += ["ntruth", "nreco"]
-        elif args.type == 1:
-            branch += ["truth_phi", "truth_z", "truth_adc", "reco_phi", "reco_z", "reco_adc", "reco_ephi"]
-        elif args.type == 2:
-            branch += ["truth_phicov", "truth_adc"]
-        elif args.type == 3:
-            branch += ["truth_zcov", "truth_adc"]
-        elif args.type == 4:
-            branch += ["truth_adc"]
+        elif args.type <= 4:
+            branch += ["truth_adc", "reco_ephi"]
+            if args.type <= 3:
+                branch += ["truth_phi", "truth_z"]
+                if args.type == 1:
+                    branch += ["reco_phi", "reco_z", "reco_adc"]
         elif args.type == 5:
             branch += ["truhit_phi", "truhit_z", "reco_phi", "reco_z"]
         else:
@@ -45,23 +43,20 @@ class Data(Dataset):
             gadc = torch.from_numpy(tree["truth_adc"])
             ephi = torch.from_numpy(tree["reco_ephi"])[:, 0].unsqueeze(1).expand(-1, gadc.size(dim=1))
             ntouch = ntouch.unsqueeze(1).expand(-1, gadc.size(dim=1))
-            ind = torch.where((gadc > 0) * (ephi < 0.01) * (ntouch >= 0))[0]
+            ind = torch.where((gadc > 0) * (ephi > 0.01) * (ntouch >= 0))[0]
             batch_ind = torch.where(ind.bincount() >= args.nout)[0]
             batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
             si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
-            if args.type == 1:
+            if args.type <= 3:
                 phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
                 z = torch.from_numpy(tree["truth_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
                 self.target = torch.stack((phi, z), dim=1)
-                si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
-                phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-                z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-                self.comp = torch.stack((phi, z), dim=1)
-                self.has_comp = True
-            elif args.type == 2:
-                self.target = torch.from_numpy(tree["truth_phicov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-            elif args.type == 3:
-                self.target = torch.from_numpy(tree["truth_zcov"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                if args.type == 1:
+                    si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
+                    phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                    z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+                    self.comp = torch.stack((phi, z), dim=1)
+                    self.has_comp = True
             elif args.type == 4:
                 self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
         elif args.type == 5:
@@ -133,11 +128,11 @@ class Net(nn.Module):
         self.nout = args.nout
         self.use_conv = args.use_conv
 
-        if self.type == 0:
+        if self.type == 0 or self.type == 2 or self.type == 3:
             nout = 1
         elif self.type == 1 or self.type == 5:
             nout = 2 * self.nout
-        elif self.type <= 4:
+        elif self.type == 4:
             nout = self.nout
         else:
             sys.exit("\nError: Wrong type number\n")
@@ -192,9 +187,11 @@ class Net(nn.Module):
 
         if self.type == 0:
             output = torch.sigmoid(x)
+        elif self.type == 2 or self.type == 3:
+            output = x
         elif self.type == 1 or self.type == 5:
             output = x.view(-1, 2, self.nout)
-        elif self.type <= 4:
+        elif self.type == 4:
             output = x.view(-1, self.nout)
         return output
 
@@ -204,10 +201,12 @@ def gauss(x, *p):
     return A * np.exp(-(x - mu) ** 2 / (2 * sigma ** 2))
 
 
-def train(args, model, device, train_loader, optimizer, epoch):
+def train(args, model, model_pos, device, train_loader, optimizer, epoch):
     model.train()
     for batch_idx, item in enumerate(train_loader):
         data, target = item[0].to(device), item[1].to(device)
+        if args.type == 2 or args.type == 3:
+            target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
         optimizer.zero_grad()
         output = model(data)
         # mean batch loss for each element
@@ -220,7 +219,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
                 100. * batch_idx / len(train_loader), loss.item()))
 
 
-def test(args, model, device, test_loader, savenow):
+def test(args, model, model_pos, device, test_loader, savenow):
     model.eval()
     test_loss = 0
     correct = 0
@@ -232,6 +231,8 @@ def test(args, model, device, test_loader, savenow):
                 data, target, comp = item[0].to(device), item[1].to(device), item[2].to(device)
             else:
                 data, target = item[0].to(device), item[1].to(device)
+            if args.type == 2 or args.type == 3:
+                target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
             output = model(data)
             # sum up batch loss for all elements
             test_loss += F.mse_loss(output, target, reduction='sum').item()
@@ -335,9 +336,11 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, pos: 1, phicov: 2, zcov: 3, adc: 4, truhit: 5, default: 0)')
+                        help='training type (ntruth: 0, pos: 1, phierr: 2, zerr: 3, adc: 4, truhit: 5, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
+    parser.add_argument('--iout', type=int, default=0, metavar='N',
+                        help='index of the output cluster used in phierr and zerr (default: 0)')
     parser.add_argument('--dir', type=str, default='data', metavar='DIR',
                         help='directory of data (default: data)')
     parser.add_argument('--nfiles', type=int, default=10000, metavar='N',
@@ -408,6 +411,15 @@ def main():
     if args.load_model:
         print("\nLoading model\n")
         model.load_state_dict(torch.load(f"save/net_weights-type{args.type}-nout{args.nout}.pt"))
+    model_pos = None
+    if args.type == 2 or args.type == 3:
+        train_type = args.type
+        args.type = 1
+        model_pos = Net(args).to(device)
+        print("\nLoading model\n")
+        model_pos.load_state_dict(torch.load(f"save/net_weights-type{args.type}-nout{args.nout}.pt"))
+        model_pos.eval()
+        args.type = train_type
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     if args.load_checkpoint:
         print("\nLoading checkpoint\n")
@@ -430,8 +442,8 @@ def main():
         test_loader = DataLoader(test_set, **test_kwargs)
         for epoch in range(epochs_trained, args.epochs):
             savenow = (epoch + 1 - epochs_trained) % args.save_interval == 0 or (epoch + 1) == args.epochs
-            train(args, model, device, train_loader, optimizer, epoch)
-            test(args, model, device, test_loader, savenow)
+            train(args, model, model_pos, device, train_loader, optimizer, epoch)
+            test(args, model, model_pos, device, test_loader, savenow)
             scheduler.step()
             if args.save_checkpoint and savenow:
                 print("\nSaving checkpoint\n")
