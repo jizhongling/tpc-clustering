@@ -19,54 +19,57 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 class Data(Dataset):
     def __init__(self, args, files):
-        branch = ["adc", "layer", "ztan", "ntouch"]
+        branch = ["adc", "layer", "ztan"]
         if args.type == 0:
-            branch += ["ntruth", "nreco"]
+            branch += ["ntruth"]
         elif args.type <= 4:
-            branch += ["truth_adc", "reco_ephi"]
+            branch += ["truth_adc"]
             if args.type <= 3:
                 branch += ["truth_phi", "truth_z"]
-                if args.type == 1:
-                    branch += ["reco_phi", "reco_z", "reco_adc"]
         elif args.type == 5:
-            branch += ["truhit_phi", "truhit_z", "reco_phi", "reco_z"]
+            branch += ["truhit_phi", "truhit_z"]
         else:
             sys.exit("\nError: Wrong type number\n")
+        if args.type <= 4:
+            branch += ["ntouch"]
+        if args.type >= 1:
+            branch += ["reco_adc"]
+        if args.type == 1 or args.type == 5:
+            branch += ["reco_phi", "reco_z"]
         tree = ur.concatenate(files, branch, library='np')
 
         self.has_comp = False
-        ntouch = torch.from_numpy(tree["ntouch"])
+        if args.type <= 4:
+            ntouch = torch.from_numpy(tree["ntouch"])
+        if args.type >= 1:
+            cadc = torch.from_numpy(tree["reco_adc"])
+            ccnt = torch.where(cadc > 70)[0].bincount() >= 1
         if args.type == 0:
             batch_ind = torch.where(ntouch >= 0)[0]
             self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].sum(dim=1).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
         elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
-            ephi = torch.from_numpy(tree["reco_ephi"])[:, 0].unsqueeze(1).expand(-1, gadc.size(dim=1))
-            ntouch = ntouch.unsqueeze(1).expand(-1, gadc.size(dim=1))
-            ind = torch.where((gadc > 0) * (ephi > 0.01) * (ntouch >= 0))[0]
-            batch_ind = torch.where(ind.bincount() >= args.nout)[0]
+            gcnt = torch.where(gadc > 0)[0].bincount() >= args.nout
+            batch_ind = torch.where(ccnt * gcnt * (ntouch >= 0))[0]
             batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
             si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
             if args.type <= 3:
                 phi = torch.from_numpy(tree["truth_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
                 z = torch.from_numpy(tree["truth_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
                 self.target = torch.stack((phi, z), dim=1)
-                if args.type == 1:
-                    si = torch.from_numpy(tree["reco_adc"])[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
-                    phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-                    z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
-                    self.comp = torch.stack((phi, z), dim=1)
-                    self.has_comp = True
             elif args.type == 4:
                 self.target = gadc[batch_si, si].type(torch.float32).view(-1, args.nout)
         elif args.type == 5:
             phi = torch.from_numpy(tree["truhit_phi"]).type(torch.float32).unsqueeze(1)
             z = torch.from_numpy(tree["truhit_z"]).type(torch.float32).unsqueeze(1)
             phiz = torch.stack((phi, z), dim=1)
-            batch_ind = torch.where((ntouch >= 0) * (LA.matrix_norm(phiz) < 1))[0]
-            self.target = phiz[batch_ind]
-            phi = torch.from_numpy(tree["reco_phi"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
-            z = torch.from_numpy(tree["reco_z"])[batch_ind, 0].type(torch.float32).unsqueeze(1)
+            batch_ind = torch.where(ccnt * (LA.matrix_norm(phiz) < 2))[0]
+            batch_si = batch_ind
+            self.target = phiz[batch_si]
+        if args.type == 1 or args.type == 5:
+            si = cadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
+            phi = torch.from_numpy(tree["reco_phi"])[batch_si, si].type(torch.float32).view(-1, args.nout)
+            z = torch.from_numpy(tree["reco_z"])[batch_si, si].type(torch.float32).view(-1, args.nout)
             self.comp = torch.stack((phi, z), dim=1)
             self.has_comp = True
 
