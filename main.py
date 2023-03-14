@@ -63,7 +63,7 @@ class Data(Dataset):
             phi = torch.from_numpy(tree["truhit_phi"]).type(torch.float32).unsqueeze(1)
             z = torch.from_numpy(tree["truhit_z"]).type(torch.float32).unsqueeze(1)
             phiz = torch.stack((phi, z), dim=1)
-            batch_ind = torch.where(ccnt * (LA.matrix_norm(phiz) < 2))[0]
+            batch_ind = torch.where(ccnt * (LA.matrix_norm(phiz) < 5))[0]
             batch_si = batch_ind
             self.target = phiz[batch_si]
         if args.type == 1 or args.type == 5:
@@ -408,7 +408,6 @@ def main():
     nfiles = min(args.nfiles, len(files))
     data_size = min(args.data_size, len(files))
 
-    epochs_trained = 0
     sets_trained = 0
     model = Net(args).to(device)
     if args.load_model:
@@ -428,7 +427,6 @@ def main():
         print("\nLoading checkpoint\n")
         checkpoint = torch.load(f"save/checkpoint-type{args.type}-nout{args.nout}")
         sets_trained = checkpoint['sets_trained']
-        epochs_trained = checkpoint['epochs_trained']
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
@@ -443,15 +441,17 @@ def main():
         train_set, test_set = random_split(dataset, [ntrain, ntest])
         train_loader = DataLoader(train_set, **train_kwargs)
         test_loader = DataLoader(test_set, **test_kwargs)
-        for epoch in range(epochs_trained, args.epochs):
-            savenow = (epoch + 1 - epochs_trained) % args.save_interval == 0 or (epoch + 1) == args.epochs
+        for epoch in range(args.epochs):
+            epoch_done = (epoch + 1) == args.epochs
+            savenow = epoch_done or (epoch + 1) % args.save_interval == 0
             train(args, model, model_pos, device, train_loader, optimizer, epoch)
             test(args, model, model_pos, device, test_loader, savenow)
             scheduler.step()
             if args.save_checkpoint and savenow:
                 print("\nSaving checkpoint\n")
-                torch.save({'sets_trained': 0 if ilast == nfiles else ilast,
-                            'epochs_trained': epoch + 1 if ilast == nfiles else epoch,
+                if epoch_done:
+                    sets_trained = 0 if ilast == nfiles else ilast
+                torch.save({'sets_trained': sets_trained,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             }, f"save/checkpoint-type{args.type}-nout{args.nout}")
