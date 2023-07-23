@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Dataset, DataLoader, random_split
+from torch.nn.utils.rnn import pack_padded_sequence
 
 
 class Data(Dataset):
@@ -96,7 +97,7 @@ class Data(Dataset):
             return input, target
 
 
-class DataMLP(Dataset):
+class DataPi0(Dataset):
     def __init__(self, args, files):
         tree = ur.concatenate(files, library='np')
 
@@ -124,6 +125,37 @@ class DataMLP(Dataset):
         return input, target
 
 
+class DataJet(Dataset):
+    def __init__(self, _, files):
+        branch = ["mc_pid", "jet_energy", "cst_px", "cst_py", "cst_pz", "cst_track", "cst_ecal", "cst_hcal"]
+        tree = ur.concatenate(files, branch, library='np')
+
+        je = torch.from_numpy(tree["jet_energy"]).type(torch.float32)
+        px = torch.from_numpy(tree["cst_px"]).type(torch.float32)
+        py = torch.from_numpy(tree["cst_py"]).type(torch.float32)
+        pz = torch.from_numpy(tree["cst_pz"]).type(torch.float32)
+        et = torch.from_numpy(tree["cst_track"]).type(torch.float32)
+        ee = torch.from_numpy(tree["cst_ecal"]).type(torch.float32)
+        eh = torch.from_numpy(tree["cst_hcal"]).type(torch.float32)
+        cst = torch.stack((px, py, pz, et, ee, eh), dim=2)
+        nseq = torch.where(pz > 0)[0].bincount()
+        batch_ind = torch.where((je > 2.) * (nseq > 0))[0]
+        self.input = cst[batch_ind]
+        self.nseq = nseq[batch_ind]
+
+        id = torch.from_numpy(tree["mc_pid"])[batch_ind].abs()
+        self.target = torch.where((id >= 4) * (id <= 6), 1, 0).type(torch.int64)
+
+    def __len__(self):
+        return len(self.target)
+
+    def __getitem__(self, idx):
+        input = self.input[idx]
+        target = self.target[idx]
+        nseq = self.nseq[idx]
+        return input, target, nseq
+
+
 class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
@@ -131,7 +163,10 @@ class Net(nn.Module):
         self.nout = args.nout
         self.use_conv = args.use_conv
 
-        if self.type == 0 or self.type == 2 or self.type == 3:
+        if self.type == 7:
+            nout = 2
+            self.loss_fn = nn.NLLLoss(weight=torch.tensor([1., 15.]))
+        elif self.type == 0 or self.type == 2 or self.type == 3 or self.type == 6:
             nout = 1
         elif self.type == 1 or self.type == 5:
             nout = 2 * self.nout
@@ -139,11 +174,19 @@ class Net(nn.Module):
             nout = self.nout
         else:
             sys.exit("\nError: Wrong type number\n")
+        if self.type != 7:
+            self.loss_fn = nn.MSELoss()
 
-        nrow = 3 if args.use_mlp else 11
-        nch = 3 if args.use_mlp else 3
+        nrow = 3 if self.type == 6 else 11
+        nch = 3 if self.type == 6 else 3
 
-        if self.use_conv:
+        if self.type == 7:
+            print("\nUsing LSTM network\n")
+            nin = 6
+            self.hin = 6
+            self.lstm = nn.LSTM(nin, self.hin, batch_first=True)
+            self.fc1 = nn.Linear(self.hin, nout)
+        elif self.use_conv:
             print("\nUsing convolutional neural network\n")
             nin = nrow**2+nch+4
             self.conv1 = nn.Conv2d(nch, nch+4, 3, 1, padding='same')
@@ -154,8 +197,8 @@ class Net(nn.Module):
             self.norm1 = nn.BatchNorm2d(nch+4)
             self.norm2 = nn.BatchNorm2d(nch+8)
             self.norm3 = nn.BatchNorm1d(nin)
-            self.dropout1 = nn.Dropout(0.25)
-            self.dropout2 = nn.Dropout(0.5)
+            #self.dropout1 = nn.Dropout(0.25)
+            #self.dropout2 = nn.Dropout(0.5)
         else:
             print("\nUsing linear neural network\n")
             nin = nrow**2+nch-1
@@ -165,7 +208,10 @@ class Net(nn.Module):
             self.norm1 = nn.BatchNorm1d(nin+5)
 
     def forward(self, x):
-        if self.use_conv:
+        if self.type == 7:
+            _, (x, _) = self.lstm(x)
+            x = self.fc1(x.view(-1, self.hin))
+        elif self.use_conv:
             x = self.norm0(x)
             x = self.conv1(x)
             x = self.norm1(x)
@@ -188,7 +234,9 @@ class Net(nn.Module):
             x = torch.tanh(x)
             x = self.fc2(x)
 
-        if self.type == 0:
+        if self.type == 7:
+            output = F.log_softmax(x, dim=1)
+        elif self.type == 0 or self.type == 6:
             output = torch.sigmoid(x)
         elif self.type == 2 or self.type == 3:
             output = x
@@ -206,14 +254,18 @@ def gauss(x, *p):
 
 def train(args, model, model_pos, device, train_loader, optimizer, epoch):
     model.train()
+    model.loss_fn.reduction = 'mean'
     for batch_idx, item in enumerate(train_loader):
         data, target = item[0].to(device), item[1].to(device)
-        if args.type == 2 or args.type == 3:
+        if args.type == 7:
+            nseq = item[2].cpu()
+            pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
+        elif args.type == 2 or args.type == 3:
             target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
         optimizer.zero_grad()
-        output = model(data)
+        output = model(pack) if args.type == 7 else model(data)
         # mean batch loss for each element
-        loss = F.mse_loss(output, target)
+        loss = model.loss_fn(output, target)
         loss.backward()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
@@ -224,26 +276,37 @@ def train(args, model, model_pos, device, train_loader, optimizer, epoch):
 
 def test(args, model, model_pos, device, test_loader, savenow):
     model.eval()
+    model.loss_fn.reduction = 'sum'
     test_loss = 0
     correct = 0
+    pos_sig = 0
+    neg_sig = 0
+    pos_bkg = 0
+    neg_bkg = 0
     hlist = []
     with torch.no_grad():
         for item in test_loader:
             nitem = len(item)
-            if nitem >= 3:
-                data, target, comp = item[0].to(device), item[1].to(device), item[2].to(device)
-            else:
-                data, target = item[0].to(device), item[1].to(device)
+            data, target = item[0].to(device), item[1].to(device)
+            if args.type == 7:
+                nseq = item[2].cpu()
+                pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
+            elif nitem >= 3:
+                comp = item[2].to(device)
             if args.type == 2 or args.type == 3:
                 target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
-            output = model(data)
+            output = model(pack) if args.type == 7 else model(data)
             # sum up batch loss for all elements
-            test_loss += F.mse_loss(output, target, reduction='sum').item()
-            if args.type == 0:
+            test_loss += model.loss_fn(output, target).item()
+            if args.type == 0 or args.type == 6 or args.type == 7:
                 # sig = 1 and bg = 0
-                pred = torch.where(output > 0.5, 1, 0)
+                pred = output.argmax(1) if args.type == 7 else torch.where(output > 0.5, 1, 0).type(torch.int64)
                 refs = target.type(torch.int64).view_as(pred)
                 correct += pred.eq(refs).sum().item()
+                pos_sig += len(torch.where((pred == 1) * (refs == 1))[0].flatten())
+                neg_sig += len(torch.where((pred == 0) * (refs == 1))[0].flatten())
+                pos_bkg += len(torch.where((pred == 1) * (refs == 0))[0].flatten())
+                neg_bkg += len(torch.where((pred == 0) * (refs == 0))[0].flatten())
                 if args.print and savenow:
                     vlist = torch.stack((target, output), dim=0)
                     hvalue = vlist.detach().cpu().numpy()
@@ -282,15 +345,23 @@ def test(args, model, model_pos, device, test_loader, savenow):
                         hlist = hll
 
     # mean batch loss for each element
-    test_loss /= len(test_loader.dataset) * len(test_loader.dataset[0][1].flatten())
+    test_size = len(test_loader.dataset)
+    test_loss /= test_size * len(test_loader.dataset[0][1].flatten())
 
-    print("\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+    print("\nTest set: Average loss: {:.4f}, Size = {}".format(test_loss, test_size))
+    if correct > 0:
+        print("Accuracy: {}/{} ({:.0f}%)".format(correct, test_size, 100. * correct / test_size))
+    if pos_sig + neg_sig > 0:
+        print("Efficiency: {}/{} ({:.0f}%)".format(pos_sig, pos_sig + neg_sig, 100. * pos_sig / (pos_sig + neg_sig)))
+    if pos_sig + pos_bkg > 0:
+        print("Purity: {}/{} ({:.0f}%)".format(pos_sig, pos_sig + pos_bkg, 100. * pos_sig / (pos_sig + pos_bkg)))
+    if pos_bkg > 0:
+        print("Rejection: {}/{} ({:.2f})".format(pos_bkg + neg_bkg, pos_bkg, 1. * (pos_bkg + neg_bkg) / pos_bkg))
+    print()
 
     if args.print and savenow:
         plt.clf()
-        if args.type == 0:
+        if args.type == 0 or args.type == 6 or args.type == 7:
             ncum = np.cumsum(hlist[0], axis=1)
             ncum = np.expand_dims(ncum[:, -1], axis=1) - ncum
             hlabel = ['Sig', 'Bg', r'$S/\sqrt{S+B}$']
@@ -339,7 +410,7 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, pos: 1, phierr: 2, zerr: 3, adc: 4, truhit: 5, default: 0)')
+                        help='training type (ntruth: 0, pos: 1, phierr: 2, zerr: 3, adc: 4, truhit: 5, pi0: 6, jet: 7, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
     parser.add_argument('--iout', type=int, default=0, metavar='N',
@@ -362,8 +433,6 @@ def main():
                         help='learning rate step gamma (default: 0.95)')
     parser.add_argument('--use-conv', action='store_true', default=False,
                         help='use convolutional neural network')
-    parser.add_argument('--use-mlp', action='store_true', default=False,
-                        help='use MLP network')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disable CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -434,7 +503,12 @@ def main():
     for iset in range(sets_trained, nfiles, data_size):
         ilast = min(iset + data_size, nfiles)
         print(f"\nDataset: {iset + 1} to {ilast}\n")
-        dataset = DataMLP(args, files[iset:ilast]) if args.use_mlp else Data(args, files[iset:ilast])
+        if args.type == 6:
+            dataset = DataPi0(args, files[iset:ilast])
+        elif args.type == 7:
+            dataset = DataJet(args, files[iset:ilast])
+        else:
+            dataset = Data(args, files[iset:ilast])
         nevents = len(dataset)
         ntrain = int(nevents*0.9)
         ntest = nevents - ntrain
@@ -459,9 +533,12 @@ def main():
     if args.save_model:
         model.cpu()
         model.eval()
-        nrow = 3 if args.use_mlp else 11
-        nch = 3 if args.use_mlp else 3
-        if args.use_conv:
+        nrow = 3 if args.type == 6 else 11
+        nch = 3 if args.type == 6 else 3
+        if args.type == 7:
+            nin = 6
+            example = torch.randn(1, 1, nin)
+        elif args.use_conv:
             example = torch.randn(1, nch, nrow, nrow)
         else:
             example = torch.randn(1, nrow**2+nch-1)
