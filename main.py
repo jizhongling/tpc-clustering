@@ -44,13 +44,13 @@ class Data(Dataset):
             ntouch = torch.from_numpy(tree["ntouch"])
         if args.type >= 1:
             cadc = torch.from_numpy(tree["reco_adc"])
-            ccnt = torch.where(cadc > 70)[0].bincount() >= 1
+            ccnt = torch.where(cadc > 70, 1, 0).sum(dim=1) >= 1
         if args.type == 0:
             batch_ind = torch.where(ntouch >= 0)[0]
             self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].sum(dim=1).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
         elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
-            gcnt = torch.where(gadc > 0)[0].bincount() >= args.nout
+            gcnt = torch.where(gadc > 0, 1, 0).sum(dim=1) >= args.nout
             batch_ind = torch.where(ccnt * gcnt * (ntouch >= 0))[0]
             batch_si = batch_ind.unsqueeze(1).expand(-1, args.nout).flatten()
             si = gadc[batch_ind].argsort(dim=1, descending=True)[:, :args.nout].flatten()
@@ -138,7 +138,7 @@ class DataJet(Dataset):
         ee = torch.from_numpy(tree["cst_ecal"]).type(torch.float32)
         eh = torch.from_numpy(tree["cst_hcal"]).type(torch.float32)
         cst = torch.stack((px, py, pz, et, ee, eh), dim=2)
-        nseq = torch.where(pz > 0)[0].bincount()
+        nseq = torch.where(pz > 0, 1, 0).sum(dim=1)
         batch_ind = torch.where((je > 2.) * (nseq > 0))[0]
         self.input = cst[batch_ind]
         self.nseq = nseq[batch_ind]
