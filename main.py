@@ -299,7 +299,7 @@ def test(args, model, model_pos, device, test_loader, savenow):
             # sum up batch loss for all elements
             test_loss += model.loss_fn(output, target).item()
             if args.type == 0 or args.type == 6 or args.type == 7:
-                # sig = 1 and bg = 0
+                # sig = 1 and bkg = 0
                 pred = output.argmax(1) if args.type == 7 else torch.where(output > 0.5, 1, 0).type(torch.int64)
                 refs = target.type(torch.int64).view_as(pred)
                 correct += pred.eq(refs).sum().item()
@@ -360,11 +360,25 @@ def test(args, model, model_pos, device, test_loader, savenow):
     print()
 
     if args.print and savenow:
+        DEFAULT_SIZE = 20
+        LARGE_SIZE = 50
+        if args.type == 0 or args.type == 6 or args.type == 7:
+            DEFAULT_SIZE = 10
+            LARGE_SIZE = 20
+
         plt.clf()
+        plt.rc('font', size=DEFAULT_SIZE)        # controls default text sizes
+        plt.rc('axes', labelsize=LARGE_SIZE)     # font size of the x and y labels
+        plt.rc('xtick', labelsize=LARGE_SIZE)    # font size of the tick labels
+        plt.rc('ytick', labelsize=LARGE_SIZE)    # font size of the tick labels
+        plt.rc('legend', fontsize=DEFAULT_SIZE)  # legend fontsize
+        plt.rc('figure', titlesize=LARGE_SIZE)   # size of the figure title
+        plt.subplots_adjust(left=0.15, bottom=0.15, right=0.95, top=0.95, hspace=0.05, wspace=0.05)
+
         if args.type == 0 or args.type == 6 or args.type == 7:
             ncum = np.cumsum(hlist[0], axis=1)
             ncum = np.expand_dims(ncum[:, -1], axis=1) - ncum
-            hlabel = ['Sig', 'Bg', r'$S/\sqrt{S+B}$']
+            hlabel = ['Sig', 'Bkg', r'$S/\sqrt{S+B}$']
             bin_centers = (yedges[:-1] + yedges[1:]) / 2
             yvalue = [ncum[1] / ncum[1, 0], ncum[0] / ncum[0, 0],
                       ncum[1] / np.sqrt(ncum[1] + ncum[0] + 1e-6) / np.sqrt(ncum[1, 0] + 1e-6)]
@@ -373,7 +387,7 @@ def test(args, model, model_pos, device, test_loader, savenow):
             plt.xlabel(r"Cut value")
             plt.ylabel(r"Efficiency")
         else:
-            hlabel = ['NN', 'Reco']
+            hlabel = ['NN', 'CCA']
             cname = ['green', 'red']
             alabel = [r"$\Delta\phi$", r"$\Delta z$"]
             fig, axs = plt.subplots(2*args.nout, nitem-1, figsize=(12*(nitem-1), 24*args.nout))
@@ -386,10 +400,10 @@ def test(args, model, model_pos, device, test_loader, savenow):
                     im = axs[2*iout, i].imshow(hlist[iout][i].T, interpolation='nearest', origin='lower',
                                                extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
                                                norm=colors.LogNorm())
-                    fig.colorbar(im, ax=axs[iout, i], fraction=0.047)
-                    axs[2*iout, i].set(xlabel=alabel[0])
-                    axs[2*iout, i].set(ylabel=alabel[1])
-                    axs[2*iout, i].set(title=f"{hlabel[i]}: No. {iout + 1} highest energy")
+                    #fig.colorbar(im, ax=axs[iout, i], fraction=0.047)
+                    axs[2*iout, i].set_xlabel(alabel[0])
+                    axs[2*iout, i].set_ylabel(alabel[1])
+                    axs[2*iout, i].set_title(f"{hlabel[i]}: No. {iout + 1} highest energy", fontsize=LARGE_SIZE)
                     for j in range(2):
                         bin_centers = (xedges[:-1] + xedges[1:]) / 2
                         hproj = np.sum(hlist[iout][i], axis=1-j)
