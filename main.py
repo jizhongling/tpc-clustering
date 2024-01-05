@@ -156,16 +156,48 @@ class DataJet(Dataset):
         return input, target, nseq
 
 
+class DataHF(Dataset):
+    def __init__(self, _, files):
+        # nin = 125, 25, 19
+        branch = ["signal", "gntracks", "gnchghad", "gnhits", "gnmaps", "gnintt", "gnmms", "gnintt1", "gnintt2", "gnintt3", "gnintt4", "gnintt5", "gnintt6", "gnintt7", "gnintt8", "gntpc", "gnlmaps", "gnlintt", "gnltpc", "gnlmms", "gpx", "gpy", "gpz", "gpt", "geta", "gphi", "gvx", "gvy", "gvz", "gvt", "gfpx", "gfpy", "gfpz", "gfx", "gfy", "gfz", "px", "py", "pz", "pt", "eta", "phi", "deltapt", "deltaeta", "deltaphi", "siqr", "siphi", "sithe", "six0", "siy0", "tpqr", "tpphi", "tpthe", "tpx0", "tpy0", "charge", "quality", "chisq", "ndf", "nhits", "layers", "nmaps", "nintt", "ntpc", "nmms", "ntpc1", "ntpc11", "ntpc2", "ntpc3", "nlmaps", "nlintt", "nltpc", "nlmms", "vertexID", "vx", "vy", "vz", "dca2d", "dca2dsigma", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "nfromtruth", "nwrong", "ntrumaps", "nwrongmaps", "ntruintt", "nwrongintt", "ntrutpc", "nwrongtpc", "ntrumms", "nwrongmms", "ntrutpc1", "nwrongtpc1", "ntrutpc11", "nwrongtpc11", "ntrutpc2", "nwrongtpc2", "ntrutpc3", "nwrongtpc3", "layersfromtruth", "npedge", "nredge", "nbig", "novlp", "merr", "msize", "nhittpcall", "nhittpcin", "nhittpcmid", "nhittpcout", "nclusall", "nclustpc", "nclusintt", "nclusmaps", "nclusmms", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]
+        #branch = ["signal", "gpx", "gpy", "gpz", "gvx", "gvy", "gvz", "charge", "vx", "vy", "vz", "dca2d", "dca2dsigma", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]
+        #branch = ["signal", "charge", "vx", "vy", "vz", "dca2d", "dca2dsigma", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]        
+        tree = ur.concatenate(files, branch, library='np')
+
+        list = []
+        for br in branch:
+            list += [torch.from_numpy(tree[br]).type(torch.float32)]
+        ten = torch.stack(list[1:], dim=1)
+        batch_ind = torch.where((list[0] == 1) | (list[0] == 0))[0]
+        self.input = ten[batch_ind]
+
+        sig = list[0][batch_ind]
+        self.target = torch.where(sig == 1, 1, 0).type(torch.int64)
+
+    def __len__(self):
+        return len(self.target)
+
+    def __getitem__(self, idx):
+        input = self.input[idx]
+        target = self.target[idx]
+        return input, target
+
+
 class Net(nn.Module):
     def __init__(self, args):
         super(Net, self).__init__()
         self.type = args.type
         self.nout = args.nout
         self.use_conv = args.use_conv
+        self.loss_fn = nn.MSELoss()
 
-        if self.type == 7:
+        if self.type == 7 or self.type == 8:
             nout = 2
-            self.loss_fn = nn.NLLLoss(weight=torch.tensor([1., 15.]))
+            if self.type == 7:
+                weight = 15.
+            elif self.type == 8:
+                weight = 3.
+            self.loss_fn = nn.NLLLoss(weight=torch.tensor([1., weight]))
         elif self.type == 0 or self.type == 2 or self.type == 3 or self.type == 6:
             nout = 1
         elif self.type == 1 or self.type == 5:
@@ -174,8 +206,6 @@ class Net(nn.Module):
             nout = self.nout
         else:
             sys.exit("\nError: Wrong type number\n")
-        if self.type != 7:
-            self.loss_fn = nn.MSELoss()
 
         nrow = 3 if self.type == 6 else 11
         nch = 3 if self.type == 6 else 3
@@ -201,11 +231,12 @@ class Net(nn.Module):
             #self.dropout2 = nn.Dropout(0.5)
         else:
             print("\nUsing linear neural network\n")
-            nin = nrow**2+nch-1
-            self.fc1 = nn.Linear(nin, nin+5)
-            self.fc2 = nn.Linear(nin+5, nout)
+            nin = 125 if self.type == 8 else nrow**2+nch-1
+            nhin = nin*2 if self.type == 8 else nin+5
+            self.fc1 = nn.Linear(nin, nhin)
+            self.fc2 = nn.Linear(nhin, nout)
             self.norm0 = nn.BatchNorm1d(nin)
-            self.norm1 = nn.BatchNorm1d(nin+5)
+            self.norm1 = nn.BatchNorm1d(nhin)
 
     def forward(self, x):
         if self.type == 7:
@@ -234,7 +265,7 @@ class Net(nn.Module):
             x = torch.tanh(x)
             x = self.fc2(x)
 
-        if self.type == 7:
+        if self.type == 7 or self.type == 8:
             output = F.log_softmax(x, dim=1)
         elif self.type == 0 or self.type == 6:
             output = torch.sigmoid(x)
@@ -298,9 +329,12 @@ def test(args, model, model_pos, device, test_loader, savenow):
             output = model(pack) if args.type == 7 else model(data)
             # sum up batch loss for all elements
             test_loss += model.loss_fn(output, target).item()
-            if args.type == 0 or args.type == 6 or args.type == 7:
+            if args.type == 0 or args.type == 6 or args.type == 7 or args.type == 8:
                 # sig = 1 and bkg = 0
-                pred = output.argmax(1) if args.type == 7 else torch.where(output > 0.5, 1, 0).type(torch.int64)
+                if args.type == 7 or args.type == 8:
+                    pred = output.argmax(1)
+                else:
+                    pred = torch.where(output > 0.5, 1, 0).type(torch.int64)
                 refs = target.type(torch.int64).view_as(pred)
                 correct += pred.eq(refs).sum().item()
                 pos_sig += len(torch.where((pred == 1) * (refs == 1))[0].flatten())
@@ -373,9 +407,9 @@ def test(args, model, model_pos, device, test_loader, savenow):
         plt.rc('ytick', labelsize=LARGE_SIZE)    # font size of the tick labels
         plt.rc('legend', fontsize=DEFAULT_SIZE)  # legend fontsize
         plt.rc('figure', titlesize=LARGE_SIZE)   # size of the figure title
-        plt.subplots_adjust(left=0.15, bottom=0.15, right=0.95, top=0.95, hspace=0.05, wspace=0.05)
+        plt.subplots_adjust(left=0.15, bottom=0.15, right=0.95, top=0.90, hspace=0.05, wspace=0.05)
 
-        if args.type == 0 or args.type == 6 or args.type == 7:
+        if args.type == 0 or args.type == 6 or args.type == 7 or args.type == 8:
             ncum = np.cumsum(hlist[0], axis=1)
             ncum = np.expand_dims(ncum[:, -1], axis=1) - ncum
             hlabel = ['Sig', 'Bkg', r'$S/\sqrt{S+B}$']
@@ -386,10 +420,11 @@ def test(args, model, model_pos, device, test_loader, savenow):
                 plt.plot(bin_centers, yvalue[i], drawstyle='steps-mid', label=hlabel[i])
             plt.xlabel(r"Cut value")
             plt.ylabel(r"Efficiency")
+            plt.title(r"100 $\pi^{\pm}$ embedded in 50 kHz Au+Au 200 GeV", fontsize='xx-large')
         else:
             hlabel = ['NN', 'CCA']
             cname = ['green', 'red']
-            alabel = [r"$\Delta\phi$", r"$\Delta z$"]
+            alabel = [r"$\Delta\phi$/binWidth", r"$\Delta z$/binWidth"]
             fig, axs = plt.subplots(2*args.nout, nitem-1, figsize=(12*(nitem-1), 24*args.nout))
             if nitem-1 == 1:
                 axs = np.expand_dims(axs, axis=1)
@@ -414,6 +449,7 @@ def test(args, model, model_pos, device, test_loader, savenow):
                         axs[2*iout+1, j].set(xlabel=alabel[j])
                         axs[2*iout+1, j].text(0.05, 0.95-0.05*i, r"{}: $\sigma$ = {:.4f}".format(hlabel[i], coeff[2]),
                                               fontsize='xx-large', transform=axs[2*iout+1, j].transAxes)
+            fig.suptitle(r"100 $\pi^{\pm}$ embedded in 50 kHz Au+Au 200 GeV", fontsize=LARGE_SIZE)
             fig.tight_layout()
         plt.legend(fontsize='xx-large')
         plt.savefig(f"save/diff-type{args.type}-nout{args.nout}.png")
@@ -424,7 +460,7 @@ def main():
     # training settings
     parser = argparse.ArgumentParser(description='sPHENIX TPC clustering')
     parser.add_argument('--type', type=int, default=0, metavar='N',
-                        help='training type (ntruth: 0, pos: 1, phierr: 2, zerr: 3, adc: 4, truhit: 5, pi0: 6, jet: 7, default: 0)')
+                        help='training type (ntruth: 0, pos: 1, phierr: 2, zerr: 3, adc: 4, truhit: 5, pi0: 6, jet: 7, hf: 8, default: 0)')
     parser.add_argument('--nout', type=int, default=1, metavar='N',
                         help='number of output clusters (default: 1)')
     parser.add_argument('--iout', type=int, default=0, metavar='N',
@@ -482,12 +518,18 @@ def main():
         train_kwargs.update(cuda_kwargs)
         test_kwargs.update(cuda_kwargs)
 
+    if args.type == 8:
+        prefix = "hf-electron"
+        key = "ntp"
+    else:
+        prefix = "training"
+        key = "T"
     files = []
     for file in os.scandir(args.dir):
-        if (file.name.startswith("training-") and
+        if (file.name.startswith(prefix) and
             file.name.endswith(".root") and
             file.is_file()):
-            files.append(file.path + ":T")
+            files.append(file.path + ":" + key)
     nfiles = min(args.nfiles, len(files))
     data_size = min(args.data_size, len(files))
 
@@ -521,6 +563,8 @@ def main():
             dataset = DataPi0(args, files[iset:ilast])
         elif args.type == 7:
             dataset = DataJet(args, files[iset:ilast])
+        elif args.type == 8:
+            dataset = DataHF(args, files[iset:ilast])
         else:
             dataset = Data(args, files[iset:ilast])
         nevents = len(dataset)
