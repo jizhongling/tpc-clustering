@@ -16,6 +16,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.nn.utils.rnn import pack_padded_sequence
+from captum.attr import IntegratedGradients
 
 
 class Data(Dataset):
@@ -37,6 +38,10 @@ class Data(Dataset):
             branch += ["reco_adc"]
         if args.type == 1 or args.type == 5:
             branch += ["reco_phi", "reco_z"]
+        self.nrow = 11
+        self.nch = 3
+        self.nin = self.nrow**2 + self.nch - 1
+        if not files: return
         tree = ur.concatenate(files, branch, library='np')
 
         self.has_comp = False
@@ -47,7 +52,7 @@ class Data(Dataset):
             ccnt = torch.where(cadc > 70, 1, 0).sum(dim=1) >= 1
         if args.type == 0:
             batch_ind = torch.where(ntouch >= 0)[0]
-            self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].sum(dim=1).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
+            self.target = torch.from_numpy(tree["ntruth"])[batch_ind, 0:].sum(dim=1).clamp(min=0, max=1).type(torch.float32)
         elif args.type <= 4:
             gadc = torch.from_numpy(tree["truth_adc"])
             gcnt = torch.where(gadc > 0, 1, 0).sum(dim=1) >= args.nout
@@ -75,9 +80,9 @@ class Data(Dataset):
             self.has_comp = True
 
         if args.use_conv:
-            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, 11, 11)
-            layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
-            ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, 11, 11)
+            adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32).view(-1, self.nrow, self.nrow)
+            layer = torch.from_numpy(tree["layer"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, self.nrow, self.nrow)
+            ztan = torch.from_numpy(tree["ztan"])[batch_ind].type(torch.float32).view(-1, 1, 1).expand(-1, self.nrow, self.nrow)
             self.input = torch.stack((adc, layer, ztan), dim=1)
         else:
             adc = torch.from_numpy(tree["adc"])[batch_ind].type(torch.float32)
@@ -99,19 +104,23 @@ class Data(Dataset):
 
 class DataPi0(Dataset):
     def __init__(self, args, files):
+        self.nrow = 5
+        self.nch = 3
+        self.nin = self.nrow**2 + self.nch - 1
+        if not files: return
         tree = ur.concatenate(files, library='np')
 
-        self.target = torch.from_numpy(tree["ntruth"]).neg().add(2).clamp(min=0, max=1).type(torch.float32).unsqueeze(1)
+        self.target = torch.from_numpy(tree["ntruth"]).neg().add(2).clamp(min=0, max=1).type(torch.float32)
 
         adc = torch.from_numpy(tree["e1"]).type(torch.float32).unsqueeze(1)
-        for i in range(1, 3*3):
+        for i in range(1, self.nrow**2):
             adc = torch.cat((adc, torch.from_numpy(tree[f"e{i+1}"]).type(torch.float32).unsqueeze(1)), dim=1)
         center_x = torch.from_numpy(tree["center_x"]).type(torch.float32).unsqueeze(1)
         center_y = torch.from_numpy(tree["center_y"]).type(torch.float32).unsqueeze(1)
         if args.use_conv:
-            adc = adc.view(-1, 3, 3)
-            center_x = center_x.view(-1, 1, 1).expand(-1, 3, 3)
-            center_y = center_y.view(-1, 1, 1).expand(-1, 3, 3)
+            adc = adc.view(-1, self.nrow, self.nrow)
+            center_x = center_x.view(-1, 1, 1).expand(-1, self.nrow, self.nrow)
+            center_y = center_y.view(-1, 1, 1).expand(-1, self.nrow, self.nrow)
             self.input = torch.stack((adc, center_x, center_y), dim=1)
         else:
             self.input = torch.cat((adc, center_x, center_y), dim=1)
@@ -128,6 +137,9 @@ class DataPi0(Dataset):
 class DataJet(Dataset):
     def __init__(self, _, files):
         branch = ["mc_pid", "jet_energy", "cst_px", "cst_py", "cst_pz", "cst_track", "cst_ecal", "cst_hcal"]
+        self.nin = len(branch[2:])
+        self.weight = 15.
+        if not files: return
         tree = ur.concatenate(files, branch, library='np')
 
         je = torch.from_numpy(tree["jet_energy"]).type(torch.float32)
@@ -158,10 +170,13 @@ class DataJet(Dataset):
 
 class DataHF(Dataset):
     def __init__(self, _, files):
-        # nin = 125, 25, 19
-        branch = ["signal", "gntracks", "gnchghad", "gnhits", "gnmaps", "gnintt", "gnmms", "gnintt1", "gnintt2", "gnintt3", "gnintt4", "gnintt5", "gnintt6", "gnintt7", "gnintt8", "gntpc", "gnlmaps", "gnlintt", "gnltpc", "gnlmms", "gpx", "gpy", "gpz", "gpt", "geta", "gphi", "gvx", "gvy", "gvz", "gvt", "gfpx", "gfpy", "gfpz", "gfx", "gfy", "gfz", "px", "py", "pz", "pt", "eta", "phi", "deltapt", "deltaeta", "deltaphi", "siqr", "siphi", "sithe", "six0", "siy0", "tpqr", "tpphi", "tpthe", "tpx0", "tpy0", "charge", "quality", "chisq", "ndf", "nhits", "layers", "nmaps", "nintt", "ntpc", "nmms", "ntpc1", "ntpc11", "ntpc2", "ntpc3", "nlmaps", "nlintt", "nltpc", "nlmms", "vertexID", "vx", "vy", "vz", "dca2d", "dca2dsigma", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "nfromtruth", "nwrong", "ntrumaps", "nwrongmaps", "ntruintt", "nwrongintt", "ntrutpc", "nwrongtpc", "ntrumms", "nwrongmms", "ntrutpc1", "nwrongtpc1", "ntrutpc11", "nwrongtpc11", "ntrutpc2", "nwrongtpc2", "ntrutpc3", "nwrongtpc3", "layersfromtruth", "npedge", "nredge", "nbig", "novlp", "merr", "msize", "nhittpcall", "nhittpcin", "nhittpcmid", "nhittpcout", "nclusall", "nclustpc", "nclusintt", "nclusmaps", "nclusmms", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]
-        #branch = ["signal", "gpx", "gpy", "gpz", "gvx", "gvy", "gvz", "charge", "vx", "vy", "vz", "dca2d", "dca2dsigma", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]
-        #branch = ["signal", "charge", "vx", "vy", "vz", "dca2d", "dca2dsigma", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]        
+        branch = ["signal", "px", "py", "pz", "pt", "eta", "phi", "deltapt", "deltaeta", "deltaphi", "siqr", "siphi", "sithe", "six0", "siy0", "tpqr", "tpphi", "tpthe", "tpx0", "tpy0", "charge", "quality", "chisq", "ndf", "nhits", "layers", "nmaps", "nintt", "ntpc", "nmms", "ntpc1", "ntpc11", "ntpc2", "ntpc3", "nlmaps", "nlintt", "nltpc", "nlmms", "vx", "vy", "vz", "dca3dxy", "dca3dxysigma", "dca3dz", "dca3dzsigma", "pcax", "pcay", "pcaz", "npedge", "nredge", "nbig", "novlp", "merr", "msize", "nhittpcall", "nhittpcin", "nhittpcmid", "nhittpcout", "nclusall", "nclustpc", "nclusintt", "nclusmaps", "nclusmms", "clus_e_cemc", "clus_e_hcalin", "clus_e_hcalout", "clus_e_outer_cemc", "clus_e_outer_hcalin", "clus_e_outer_hcalout"]
+        self.target_name = branch[0]
+        self.feature_names = branch[1:]
+        self.nin = len(self.feature_names)
+        self.attributions = torch.zeros(self.nin, dtype=torch.float64).cpu()
+        self.weight = 3.
+        if not files: return
         tree = ur.concatenate(files, branch, library='np')
 
         list = []
@@ -193,11 +208,7 @@ class Net(nn.Module):
 
         if self.type == 7 or self.type == 8:
             nout = 2
-            if self.type == 7:
-                weight = 15.
-            elif self.type == 8:
-                weight = 3.
-            self.loss_fn = nn.NLLLoss(weight=torch.tensor([1., weight]))
+            self.loss_fn = nn.NLLLoss(weight=torch.tensor([1., args.weight]))
         elif self.type == 0 or self.type == 2 or self.type == 3 or self.type == 6:
             nout = 1
         elif self.type == 1 or self.type == 5:
@@ -207,36 +218,42 @@ class Net(nn.Module):
         else:
             sys.exit("\nError: Wrong type number\n")
 
-        nrow = 3 if self.type == 6 else 11
-        nch = 3 if self.type == 6 else 3
+        nin = args.nin
+        nrow = args.nrow
+        nch = args.nch
 
         if self.type == 7:
             print("\nUsing LSTM network\n")
-            nin = 6
-            self.hin = 6
+            self.net_type = 2
+            self.hin = nin
             self.lstm = nn.LSTM(nin, self.hin, batch_first=True)
             self.fc1 = nn.Linear(self.hin, nout)
         elif self.use_conv:
             print("\nUsing convolutional neural network\n")
-            nin = nrow**2+nch+4
+            self.net_type = 1
+            nhin = nrow**2+nch+4
             self.conv1 = nn.Conv2d(nch, nch+4, 3, 1, padding='same')
             self.conv2 = nn.Conv2d(nch+4, nch+8, 3, 1, padding='same')
-            self.fc1 = nn.Linear((nch+8)*math.floor(nrow/2)**2, nin)
-            self.fc2 = nn.Linear(nin, nout)
+            self.fc1 = nn.Linear((nch+8)*math.floor(nrow/2)**2, nhin)
+            self.fc2 = nn.Linear(nhin, nout)
             self.norm0 = nn.BatchNorm2d(nch)
             self.norm1 = nn.BatchNorm2d(nch+4)
             self.norm2 = nn.BatchNorm2d(nch+8)
-            self.norm3 = nn.BatchNorm1d(nin)
+            self.norm3 = nn.BatchNorm1d(nhin)
             #self.dropout1 = nn.Dropout(0.25)
             #self.dropout2 = nn.Dropout(0.5)
         else:
             print("\nUsing linear neural network\n")
-            nin = 125 if self.type == 8 else nrow**2+nch-1
-            nhin = nin*2 if self.type == 8 else nin+5
+            self.net_type = 0
+            nhin = nin+5
             self.fc1 = nn.Linear(nin, nhin)
-            self.fc2 = nn.Linear(nhin, nout)
+            self.fc2 = nn.Linear(nhin, nhin)
+            self.fc3 = nn.Linear(nhin, nhin)
+            self.fc4 = nn.Linear(nhin, nout)
             self.norm0 = nn.BatchNorm1d(nin)
             self.norm1 = nn.BatchNorm1d(nhin)
+            self.norm2 = nn.BatchNorm1d(nhin)
+            self.norm3 = nn.BatchNorm1d(nhin)
 
     def forward(self, x):
         if self.type == 7:
@@ -262,13 +279,19 @@ class Net(nn.Module):
             x = self.norm0(x)
             x = self.fc1(x)
             x = self.norm1(x)
-            x = torch.tanh(x)
+            x = F.relu(x)
             x = self.fc2(x)
+            x = self.norm2(x)
+            x = F.relu(x)
+            x = self.fc3(x)
+            x = self.norm3(x)
+            x = F.relu(x)
+            x = self.fc4(x)
 
         if self.type == 7 or self.type == 8:
             output = F.log_softmax(x, dim=1)
         elif self.type == 0 or self.type == 6:
-            output = torch.sigmoid(x)
+            output = torch.sigmoid(x).squeeze(1)
         elif self.type == 2 or self.type == 3:
             output = x
         elif self.type == 1 or self.type == 5:
@@ -333,6 +356,7 @@ def test(args, model, model_pos, device, test_loader, savenow):
                 # sig = 1 and bkg = 0
                 if args.type == 7 or args.type == 8:
                     pred = output.argmax(1)
+                    output = torch.exp(output[:, 1])
                 else:
                     pred = torch.where(output > 0.5, 1, 0).type(torch.int64)
                 refs = target.type(torch.int64).view_as(pred)
@@ -344,7 +368,7 @@ def test(args, model, model_pos, device, test_loader, savenow):
                 if args.print and savenow:
                     vlist = torch.stack((target, output), dim=0)
                     hvalue = vlist.detach().cpu().numpy()
-                    hist, xedges, yedges = np.histogram2d(hvalue[0, :, 0], hvalue[1, :, 0],
+                    hist, xedges, yedges = np.histogram2d(hvalue[0, :], hvalue[1, :],
                                                           bins=[2, 100], range=[[-0.5, 1.5], [0, 1]])
                     if hlist:
                         hlist[0] = np.add(hlist[0], hist)
@@ -394,11 +418,11 @@ def test(args, model, model_pos, device, test_loader, savenow):
     print()
 
     if args.print and savenow:
-        DEFAULT_SIZE = 20
-        LARGE_SIZE = 50
-        if args.type == 0 or args.type == 6 or args.type == 7:
-            DEFAULT_SIZE = 10
-            LARGE_SIZE = 20
+        DEFAULT_SIZE = 10
+        LARGE_SIZE = 20
+        if args.type == 1 or args.type == 5:
+            DEFAULT_SIZE = 20
+            LARGE_SIZE = 50
 
         plt.clf()
         plt.rc('font', size=DEFAULT_SIZE)        # controls default text sizes
@@ -420,7 +444,8 @@ def test(args, model, model_pos, device, test_loader, savenow):
                 plt.plot(bin_centers, yvalue[i], drawstyle='steps-mid', label=hlabel[i])
             plt.xlabel(r"Cut value")
             plt.ylabel(r"Efficiency")
-            plt.title(r"100 $\pi^{\pm}$ embedded in 50 kHz Au+Au 200 GeV", fontsize='xx-large')
+            if args.type == 0:
+                plt.title(r"100 $\pi^{\pm}$ embedded in 50 kHz Au+Au 200 GeV", fontsize='xx-large')
         else:
             hlabel = ['NN', 'CCA']
             cname = ['green', 'red']
@@ -493,6 +518,10 @@ def main():
                         help='how many groups of dataset to wait before saving the checkpoint (default: 20)')
     parser.add_argument('--print', action='store_true', default=False,
                         help='print output')
+    parser.add_argument('--calc-attr', action='store_true', default=False,
+                        help='calculate and print attributions')
+    parser.add_argument('--save-data', action='store_true', default=False,
+                        help='save data with predictions')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='save the current model')
     parser.add_argument('--load-model', action='store_true', default=False,
@@ -532,8 +561,23 @@ def main():
             files.append(file.path + ":" + key)
     nfiles = min(args.nfiles, len(files))
     data_size = min(args.data_size, len(files))
+    feature_dict = {}
 
     sets_trained = 0
+    if args.type == 6:
+        dataset = DataPi0(args, None)
+    elif args.type == 7:
+        dataset = DataJet(args, None)
+    elif args.type == 8:
+        dataset = DataHF(args, None)
+    else:
+        dataset = Data(args, None)
+    args.nin = getattr(dataset, 'nin', 0)
+    args.nrow = getattr(dataset, 'nrow', 0)
+    args.nch = getattr(dataset, 'nch', 0)
+    args.weight = getattr(dataset, 'weight', 1.)
+    calc_attr = args.calc_attr and hasattr(dataset, 'attributions')
+    save_data = args.save_data and hasattr(dataset, 'feature_names')
     model = Net(args).to(device)
     if args.load_model:
         print("\nLoading model\n")
@@ -568,7 +612,7 @@ def main():
         else:
             dataset = Data(args, files[iset:ilast])
         nevents = len(dataset)
-        ntrain = int(nevents*0.9)
+        ntrain = int(nevents*0.5) if save_data else int(nevents*0.9)
         ntest = nevents - ntrain
         train_set, test_set = random_split(dataset, [ntrain, ntest])
         train_loader = DataLoader(train_set, **train_kwargs)
@@ -587,19 +631,58 @@ def main():
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
                             }, f"save/checkpoint-type{args.type}-nout{args.nout}")
+        if calc_attr or save_data:
+            for item in test_loader:
+                model.eval()
+                data, target = item[0].to(device), item[1].to(device)
+                output = model(data)
+                # sig = 1 and bkg = 0
+                if args.type == 7 or args.type == 8:
+                    pred = output.argmax(1)
+                    output = torch.exp(output[:, 1])
+                else:
+                    pred = torch.where(output > 0.5, 1, 0).type(torch.int64)
+                refs = target.type(torch.int64).view_as(pred)
+                if calc_attr:
+                    batch_ind = torch.where((pred == 1) * (refs == 1))[0]
+                    ig = IntegratedGradients(model)
+                    dataset.attributions += ig.attribute(data[batch_ind], target=1, n_steps=5).detach().abs().sum(dim=0).cpu()
+                if save_data:
+                    target_name = dataset.target_name
+                    if feature_dict:
+                        feature_dict[target_name] = np.concatenate((feature_dict[target_name], target.detach().cpu().numpy()), axis=0)
+                        feature_dict["output"] = np.concatenate((feature_dict["output"], output.detach().cpu().numpy()), axis=0)
+                        for i, feature_name in enumerate(dataset.feature_names):
+                            feature_dict[feature_name] = np.concatenate((feature_dict[feature_name], data[:,i].detach().cpu().numpy()), axis=0)
+                    else:
+                        feature_dict[target_name] = target.detach().cpu().numpy()
+                        feature_dict["output"] = output.detach().cpu().numpy()
+                        for i, feature_name in enumerate(dataset.feature_names):
+                            feature_dict[feature_name] = data[:,i].detach().cpu().numpy()
+    if calc_attr:
+        plt.clf()
+        fig = plt.figure(figsize=(30, 15))
+        plt.bar(dataset.feature_names, dataset.attributions.numpy())
+        plt.xticks(rotation=90)
+        plt.ylabel("Integrated gradients")
+        fig.tight_layout()
+        plt.savefig(f"save/attr-type{args.type}-nout{args.nout}.png")
+        print(f"\nFigure saved to save/attr-type{args.type}-nout{args.nout}.png\n")
+    if save_data:
+        with ur.recreate(f"save/data-type{args.type}-nout{args.nout}.root", compression=ur.ZLIB(4)) as f:
+            f[key] = feature_dict
+            f[key].show()
+            print(f"\nData saved to save/data-type{args.type}-nout{args.nout}.root\n")
 
     if args.save_model:
         model.cpu()
         model.eval()
-        nrow = 3 if args.type == 6 else 11
-        nch = 3 if args.type == 6 else 3
-        if args.type == 7:
-            nin = 6
-            example = torch.randn(1, 1, nin)
-        elif args.use_conv:
-            example = torch.randn(1, nch, nrow, nrow)
-        else:
-            example = torch.randn(1, nrow**2+nch-1)
+        if model.net_type == 0:
+            example = torch.randn(1, args.nin)
+        elif model.net_type == 1:
+            example = torch.randn(1, args.nch, args.nrow, args.nrow)
+        elif model.net_type == 2:
+            example = torch.randn(1, 1, args.nin)
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save(f"save/net_model-type{args.type}-nout{args.nout}.pt")
         torch.save(model.state_dict(), f"save/net_weights-type{args.type}-nout{args.nout}.pt")
