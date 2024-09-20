@@ -204,6 +204,8 @@ class Net(nn.Module):
         self.type = args.type
         self.nout = args.nout
         self.use_conv = args.use_conv
+        self.use_lstm = args.use_lstm
+        self.use_tran = args.use_tran
         self.loss_fn = nn.MSELoss()
 
         if self.type == 7 or self.type == 8:
@@ -222,7 +224,14 @@ class Net(nn.Module):
         nrow = args.nrow
         nch = args.nch
 
-        if self.type == 7:
+        if self.use_tran:
+            print("\nUsing transformer net\n")
+            self.net_type = 3
+            self.nemb = nin
+            self.tran = nn.Transformer(d_model=nin, nhead=1, num_encoder_layers=2, num_decoder_layers=1, dim_feedforward=32,
+                                       dropout=0, batch_first=True, dtype=torch.float32)
+            self.fc1 = nn.Linear(self.nemb, nout)
+        elif self.use_lstm:
             print("\nUsing LSTM network\n")
             self.net_type = 2
             self.hin = nin
@@ -255,8 +264,11 @@ class Net(nn.Module):
             self.norm2 = nn.BatchNorm1d(nhin)
             self.norm3 = nn.BatchNorm1d(nhin)
 
-    def forward(self, x):
-        if self.type == 7:
+    def forward(self, x, tgt=None):
+        if self.use_tran:
+            x = self.tran(x, tgt)
+            x = self.fc1(x.view(-1, self.nemb))
+        elif self.use_lstm:
             _, (x, _) = self.lstm(x)
             x = self.fc1(x.view(-1, self.hin))
         elif self.use_conv:
@@ -311,13 +323,19 @@ def train(args, model, model_pos, device, train_loader, optimizer, epoch):
     model.loss_fn.reduction = 'mean'
     for batch_idx, item in enumerate(train_loader):
         data, target = item[0].to(device), item[1].to(device)
-        if args.type == 7:
+        if model.net_type == 2:
             nseq = item[2].cpu()
             pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
-        elif args.type == 2 or args.type == 3:
+        if args.type == 2 or args.type == 3:
             target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
         optimizer.zero_grad()
-        output = model(pack) if args.type == 7 else model(data)
+        if model.net_type == 3:
+            tgt = torch.ones(data.shape[0], 1, model.nemb, dtype=torch.float32, device=device)
+            output = model(data, tgt)
+        elif model.net_type == 2:
+            output = model(pack)
+        else:
+            output = model(data)
         # mean batch loss for each element
         loss = model.loss_fn(output, target)
         loss.backward()
@@ -342,14 +360,20 @@ def test(args, model, model_pos, device, test_loader, savenow):
         for item in test_loader:
             nitem = len(item)
             data, target = item[0].to(device), item[1].to(device)
-            if args.type == 7:
+            if model.net_type == 2:
                 nseq = item[2].cpu()
                 pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
             elif nitem >= 3:
                 comp = item[2].to(device)
             if args.type == 2 or args.type == 3:
                 target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
-            output = model(pack) if args.type == 7 else model(data)
+            if model.net_type == 3:
+                tgt = torch.ones(data.shape[0], 1, model.nemb, dtype=torch.float32, device=device)
+                output = model(data, tgt)
+            elif model.net_type == 2:
+                output = model(pack)
+            else:
+                output = model(data)
             # sum up batch loss for all elements
             test_loss += model.loss_fn(output, target).item()
             if args.type == 0 or args.type == 6 or args.type == 7 or args.type == 8:
@@ -508,6 +532,10 @@ def main():
                         help='learning rate step gamma (default: 0.95)')
     parser.add_argument('--use-conv', action='store_true', default=False,
                         help='use convolutional neural network')
+    parser.add_argument('--use-lstm', action='store_true', default=False,
+                        help='use lstm network')
+    parser.add_argument('--use-tran', action='store_true', default=False,
+                        help='use transformer network')
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='disable CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -567,6 +595,8 @@ def main():
     if args.type == 6:
         dataset = DataPi0(args, None)
     elif args.type == 7:
+        if not args.use_tran:
+            args.use_lstm = True
         dataset = DataJet(args, None)
     elif args.type == 8:
         dataset = DataHF(args, None)
@@ -682,7 +712,9 @@ def main():
         elif model.net_type == 1:
             example = torch.randn(1, args.nch, args.nrow, args.nrow)
         elif model.net_type == 2:
-            example = torch.randn(1, 1, args.nin)
+            example = torch.randn(1, 3, args.nin)
+        elif model.net_type == 3:
+            example = (torch.randn(1, 50, args.nin), torch.ones(1, 1, args.nin))
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save(f"save/net_model-type{args.type}-nout{args.nout}.pt")
         torch.save(model.state_dict(), f"save/net_weights-type{args.type}-nout{args.nout}.pt")
