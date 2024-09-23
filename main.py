@@ -151,9 +151,11 @@ class DataJet(Dataset):
         eh = torch.from_numpy(tree["cst_hcal"]).type(torch.float32)
         cst = torch.stack((px, py, pz, et, ee, eh), dim=2)
         nseq = torch.where(pz > 0, 1, 0).sum(dim=1)
+        mask = torch.where(pz > 0, False, True)
         batch_ind = torch.where((je > 2.) * (nseq > 0))[0]
         self.input = cst[batch_ind]
         self.nseq = nseq[batch_ind]
+        self.mask = mask[batch_ind]
 
         id = torch.from_numpy(tree["mc_pid"])[batch_ind].abs()
         self.target = torch.where((id >= 4) * (id <= 6), 1, 0).type(torch.int64)
@@ -165,7 +167,8 @@ class DataJet(Dataset):
         input = self.input[idx]
         target = self.target[idx]
         nseq = self.nseq[idx]
-        return input, target, nseq
+        mask = self.mask[idx]
+        return input, target, nseq, mask
 
 
 class DataHF(Dataset):
@@ -229,13 +232,13 @@ class Net(nn.Module):
             self.net_type = 3
             self.nemb = nin
             self.tran = nn.Transformer(d_model=nin, nhead=1, num_encoder_layers=2, num_decoder_layers=1, dim_feedforward=32,
-                                       dropout=0, batch_first=True, dtype=torch.float32)
+                                       dropout=0, batch_first=True)
             self.fc1 = nn.Linear(self.nemb, nout)
         elif self.use_lstm:
             print("\nUsing LSTM network\n")
             self.net_type = 2
             self.hin = nin
-            self.lstm = nn.LSTM(nin, self.hin, batch_first=True)
+            self.lstm = nn.LSTM(nin, self.hin, dropout=0, batch_first=True)
             self.fc1 = nn.Linear(self.hin, nout)
         elif self.use_conv:
             print("\nUsing convolutional neural network\n")
@@ -264,9 +267,9 @@ class Net(nn.Module):
             self.norm2 = nn.BatchNorm1d(nhin)
             self.norm3 = nn.BatchNorm1d(nhin)
 
-    def forward(self, x, tgt=None):
+    def forward(self, x, tgt=None, mask=None):
         if self.use_tran:
-            x = self.tran(x, tgt)
+            x = self.tran(x, tgt, src_key_padding_mask=mask)
             x = self.fc1(x.view(-1, self.nemb))
         elif self.use_lstm:
             _, (x, _) = self.lstm(x)
@@ -323,16 +326,16 @@ def train(args, model, model_pos, device, train_loader, optimizer, epoch):
     model.loss_fn.reduction = 'mean'
     for batch_idx, item in enumerate(train_loader):
         data, target = item[0].to(device), item[1].to(device)
-        if model.net_type == 2:
-            nseq = item[2].cpu()
-            pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
         if args.type == 2 or args.type == 3:
             target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
         optimizer.zero_grad()
         if model.net_type == 3:
+            mask = item[3].to(device)
             tgt = torch.ones(data.shape[0], 1, model.nemb, dtype=torch.float32, device=device)
-            output = model(data, tgt)
+            output = model(data, tgt, mask)
         elif model.net_type == 2:
+            nseq = item[2].cpu()
+            pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
             output = model(pack)
         else:
             output = model(data)
@@ -360,17 +363,17 @@ def test(args, model, model_pos, device, test_loader, savenow):
         for item in test_loader:
             nitem = len(item)
             data, target = item[0].to(device), item[1].to(device)
-            if model.net_type == 2:
-                nseq = item[2].cpu()
-                pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
-            elif nitem >= 3:
+            if nitem >= 3 and args.type != 7:
                 comp = item[2].to(device)
             if args.type == 2 or args.type == 3:
                 target = (model_pos(data)[:, args.type-2, args.iout] - target[:, args.type-2, args.iout]).unsqueeze(1).abs()
             if model.net_type == 3:
+                mask = item[3].to(device)
                 tgt = torch.ones(data.shape[0], 1, model.nemb, dtype=torch.float32, device=device)
-                output = model(data, tgt)
+                output = model(data, tgt, mask)
             elif model.net_type == 2:
+                nseq = item[2].cpu()
+                pack = pack_padded_sequence(data, nseq, batch_first=True, enforce_sorted=False)
                 output = model(pack)
             else:
                 output = model(data)
@@ -714,7 +717,7 @@ def main():
         elif model.net_type == 2:
             example = torch.randn(1, 3, args.nin)
         elif model.net_type == 3:
-            example = (torch.randn(1, 50, args.nin), torch.ones(1, 1, args.nin))
+            example = (torch.randn(1, 15, args.nin), torch.ones(1, 1, args.nin))
         traced_script_module = torch.jit.trace(model, example)
         traced_script_module.save(f"save/net_model-type{args.type}-nout{args.nout}.pt")
         torch.save(model.state_dict(), f"save/net_weights-type{args.type}-nout{args.nout}.pt")
